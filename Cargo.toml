@@ -1,0 +1,28 @@
+[package]
+name = "lym"
+version = "0.1.69"
+edition = "2024"
+
+[dependencies]
+colored = "3.0.0"
+dialoguer = "0.11.0"
+dirs = "6.0.0"
+indicatif = "0.18.0"
+reqwest = { version = "0.12.22", features = ["blocking", "json"] }
+serde = "1.0.219"
+serde_json = "1.0.140"
+
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+codegen-units = 16
+panic = "unwind"
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = "fat"
+codegen-units = 1
+strip = false
+panic = "abort"
