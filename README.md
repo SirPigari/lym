@@ -66,10 +66,10 @@ it should have:
 ### Field Descriptions
 
 - **name** (string, required)  
-  The package’s name.
+  The package's name.
 
 - **version** (string, required)  
-  The package’s version in [semver](https://semver.org/) format.
+  The package's version in [semver](https://semver.org/) format.
 
 - **required_lucia_version** (string, required)  
   The minimum compatible version of Lucia required to use this package.
@@ -89,6 +89,35 @@ it should have:
 - **dependencies** (object, optional)  
   Package dependencies with version requirements, e.g., `"package2": "^3.69.42"`.
 
+## Good Practices
+
+- **Avoid using `#config` inline preprocessor directives inside your package source.**  
+  Instead, declare any required config keys in the `config` field of your `manifest.json`. This keeps configuration centralized and cleaner.
+
+- **For include-type packages (not import), always wrap your source code with include guards.**  
+  Use `#ifndef #define` and `#endif` around your code, just like in C, to prevent multiple inclusions and redefinition errors.
+
+- **Keep your `manifest.json` clean and accurate.**  
+  Only list actual dependencies in the `dependencies` field. Avoid unnecessary or outdated entries.
+
+- **Keep the `description` field in your manifest short, clear, and easy to read.**  
+  This helps users quickly understand what your package does without extra fluff.
+
+- **Specify the minimum required Lucia version precisely using semantic versioning.**  
+  This helps ensure your package is used only in compatible environments.
+
+- **Use meaningful and concise descriptions.**  
+  This makes your package easier to discover and understand by others.
+
+- **Test your package before submitting.**  
+  Make sure all declared dependencies and config keys work as expected to avoid issues for users.
+
+- **Create a `README.md` (or `.txt`) in the root of your package for documentation.**  
+  Use this file to explain usage, special setup, examples, or anything else that doesn't belong in `manifest.json`.
+
+---
+
+Following these helps keep the package ecosystem healthy, compatible, and easier to maintain! uwu
 
 ## LICENSE
 
