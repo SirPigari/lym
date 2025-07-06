@@ -5,32 +5,32 @@
 ## Commands
 
 `lym`  
-- `install [package_name] [--no-confirm] [-v] [--help]`  
-  Installs the package you want, with options to skip confirmation, get more details, or see help.
+- **install** `[package_name] [--no-confirm] [-v] [--help]`  
+  Installs one or more packages. Use `--no-confirm` to skip prompts, `-v` for verbose output, or `--help` for usage info.
 
-- `list [--remote | --local | --store] [--no-desc] [--no-ver] [--no-std] [--help]`  
-  Shows you packages that are installed locally, remotely, or in the store. You can hide descriptions, versions, or standard packages if you want.
+- **list** `[--remote | --local | --store] [--no-desc] [--no-ver] [--no-std] [--help]`  
+  Shows packages installed locally, remotely, or stored. Optional flags hide descriptions, versions, or standard packages.
 
-- `download [package_name] [output_path] [--no-confirm] [-v] [--help]`  
-  Downloads a package to a folder you choose, with options to skip confirmation and see more info.
+- **download** `[package_name] [output_path] [--no-confirm] [-v] [--help]`  
+  Downloads a package to a specified folder. Flags allow skipping confirmation or showing more details.
 
-- `remove [package_name] [--no-confirm] [-v] [--help]`  
-  Deletes a package from your system. You can skip confirmation or get detailed output if needed.
+- **remove** `[package_name] [--no-confirm] [-v] [--help]`  
+  Deletes a package from your system. Use flags to skip confirmation or get verbose output.
 
-- `disable [package_name] [--no-confirm] [-v] [--help]`  
-  Temporarily turns off a package without deleting it, with options for confirmation and verbose output.
+- **disable** `[package_name] [--no-confirm] [-v] [--help]`  
+  Temporarily disables a package by moving it to the store without deleting it. Confirmation and verbose options available.
 
-- `enable [package_name] [--no-confirm] [-v] [--help]`  
-  Turns a disabled package back on, also with optional confirmation and detailed output.
+- **enable** `[package_name] [--no-confirm] [-v] [--help]`  
+  Re-enables a previously disabled package, with optional confirmation and verbose output.
 
-- `config [ lym | lucia | fetch ] [--set <key=value>] [--get <key>] [--help] [--no-confirm]`  
-  Lets you view or change settings for Lym, Lucia, or refetch the Lym config (fetch just fetches doesnt do anything with the argv).
+- **config** `[ lym | lucia | fetch ] [--set <key=value>] [--get <key>] [--help] [--no-confirm]`  
+  View or update settings for Lym, Lucia, or refetch the config. `fetch` only updates the config without using any arguments.
 
-- `modify [package_name] [--stored] <key> [value1 [value2 ...]] [--no-confirm] [--help]`  
-  Changes info in a package's manifest or stored data by updating keys and values.
+- **modify** `[package_name] [--stored] <key> [value1 [value2 ...]] [--no-confirm] [--help]`  
+  Edits package manifest or stored data by changing keys and values.
 
-- `new [package | module] [name] [path] [--no-confirm] [--help] [--main-file:<name>]`  
-  Creates a new package or module with your chosen name and location, and you can set the main file if you want.
+- **new** `[package | module] [name] [path] [--no-confirm] [--help] [--main-file:<name>]`  
+  Creates a new package or module at the given path.
 
 ## Adding a Package
 
