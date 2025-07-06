@@ -678,6 +678,7 @@ dependencies = [
  "dialoguer",
  "dirs",
  "indicatif",
+ "once_cell",
  "reqwest",
  "serde",
  "serde_json",

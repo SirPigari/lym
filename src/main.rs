@@ -15,6 +15,13 @@ use serde::{Serialize, Deserialize};
 use serde_json::{Value as JsonValue, json};
 use reqwest::blocking::Client;
 use base64::{engine::general_purpose, Engine as _};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+mod db;
+mod utils;
+
+use db::{LibInfo, STD_LIBS};
+use utils::check_version;
 
 fn get_lym_dir() -> io::Result<PathBuf> {
     let home_dir = dirs::home_dir().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Could not find home directory"))?;
@@ -166,8 +173,281 @@ fn print_help() {
     );
 }
 
+fn command_help(cmd: &str) {
+    match cmd {
+        "list" => {
+            println!(
+                "{} {} {} {}\n\n{}",
+                "Usage:".bright_green().bold(),
+                "lym".bright_cyan().bold(),
+                "list".bright_cyan(),
+                "[--remote | --local] [--no-desc] [--no-ver] [--no-std]".bright_yellow(),
+                "Lists installed packages or remote packages.".bright_white()
+            );
+        }
+        "install" => {
+            println!(
+                "{} {} {} {}\n\n{}",
+                "Usage:".bright_green().bold(),
+                "lym".bright_cyan().bold(),
+                "install".bright_cyan(),
+                "[package_name] [--no-confirm] [-v] [--help]".bright_yellow(),
+                "Installs a package from the remote repository.".bright_white()
+            );
+        }
+        _ => {
+            eprintln!("{}", format!("Unknown command: '{}'", cmd).red().bold());
+            print_help();
+        }
+    }
+}
+
+fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Result<(), String> {
+    let lym_dir = get_lym_dir().map_err(|e| format!("Failed to get lym dir: {}", e))?;
+    let config_path = lym_dir.join("config.json");
+    let config_json: JsonValue = fs::read_to_string(&config_path)
+        .map_err(|e| format!("Failed to read config.json: {}", e))
+        .and_then(|data| serde_json::from_str(&data).map_err(|e| format!("Invalid config.json: {}", e)))?;
+
+    let lucia_path_str = config_json.get("lucia_path")
+        .and_then(JsonValue::as_str)
+        .ok_or("Lucia path not set in config. Run lym config or reinstall lucia.")?;
+    let lucia_path = Path::new(lucia_path_str);
+
+    let libs_dir = lucia_path
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(lucia_path)
+        .join("libs");
+
+    if !libs_dir.exists() {
+        if verbose {
+            println!("{}", format!("libs directory not found at {}, creating it", libs_dir.display()).yellow());
+        }
+        fs::create_dir_all(&libs_dir).map_err(|e| format!("Failed to create libs dir: {}", e))?;
+    }
+
+    let repo_slug = config_json.get("repository_slug")
+        .and_then(JsonValue::as_str)
+        .ok_or("Repository slug not set in config.")?;
+
+    let local_pkg_path = libs_dir.join(pkg_name);
+    let already_installed = local_pkg_path.exists();
+
+    if already_installed && !no_confirm {
+        let override_confirm = Confirm::new()
+            .with_prompt(format!("Package '{}' is already installed. Override? (Y/n)", pkg_name))
+            .default(false)
+            .interact()
+            .map_err(|e| format!("Prompt error: {}", e))?;
+
+        if !override_confirm {
+            if verbose {
+                println!("{}", "Install cancelled by user.".yellow());
+            }
+            return Ok(());
+        }
+    }
+
+    let manifest_url = format!("https://api.github.com/repos/{}/contents/libs/{}/manifest.json", repo_slug, pkg_name);
+    let client = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+    let resp = client.get(&manifest_url)
+        .header("User-Agent", "lym-install")
+        .send()
+        .map_err(|e| format!("Failed to send request: {}", e))?;
+
+    if !resp.status().is_success() {
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(format!("Package '{}' not found in the remote repository. Please check the package name and try again.", pkg_name));
+        }
+        return Err(format!("Failed to get manifest.json: HTTP {}", resp.status()));
+    }
+
+    let manifest_json: JsonValue = resp.json()
+        .map_err(|e| format!("Failed to parse manifest.json from remote: {}", e))?;
+
+    let encoded_content = manifest_json.get("content")
+        .and_then(JsonValue::as_str)
+        .ok_or("manifest.json content missing in remote response.")?
+        .replace('\n', "");
+
+    let decoded_bytes = general_purpose::STANDARD.decode(&encoded_content)
+        .map_err(|e| format!("Failed to decode manifest.json content: {}", e))?;
+
+    let manifest_str = String::from_utf8(decoded_bytes)
+        .map_err(|e| format!("manifest.json is not valid UTF-8: {}", e))?;
+
+    let manifest: JsonValue = serde_json::from_str(&manifest_str)
+        .map_err(|e| format!("Failed to parse manifest.json: {}", e))?;
+
+    let required_version = manifest.get("required_lucia_version")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("0.0.0");
+
+    let current_version = config_json.get("build_info")
+        .and_then(|b| b.get("version"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("0.0.0");
+
+    if verbose {
+        println!("{}", format!("Checking lucia version: required '{}' vs current '{}'", required_version, current_version));
+    }
+
+    if !check_version(current_version, required_version) {
+        eprintln!("{}", format!("Warning: Package '{}' requires lucia version '{}', but current version is '{}'", pkg_name, required_version, current_version).yellow());
+
+        if !no_confirm {
+            let cont = Confirm::new()
+                .with_prompt("Continue installation anyway? (Y/n)")
+                .default(false)
+                .interact()
+                .map_err(|e| format!("Prompt error: {}", e))?;
+
+            if !cont {
+                if verbose {
+                    println!("{}", "Install cancelled due to version mismatch.".yellow());
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    let api_url = format!("https://api.github.com/repos/{}/contents/libs/{}", repo_slug, pkg_name);
+    let resp = client.get(&api_url)
+        .header("User-Agent", "lym-install")
+        .send()
+        .map_err(|e| format!("Failed to send request: {}", e))?;
+
+    if !resp.status().is_success() {
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(format!("Package '{}' not found in the remote repository. Please check the package name and try again.", pkg_name));
+        }
+        return Err(format!("Failed to get remote package contents: HTTP {}", resp.status()));
+    }
+
+    let contents = resp.json::<Vec<JsonValue>>()
+        .map_err(|e| format!("Failed to parse remote package directory listing: {}", e))?;
+
+    if verbose {
+        println!("{}", format!("Found {} files/directories to download", contents.len()));
+    }
+
+    if local_pkg_path.exists() {
+        if verbose {
+            println!("{}", format!("Removing existing package directory {}", local_pkg_path.display()));
+        }
+        fs::remove_dir_all(&local_pkg_path).map_err(|e| format!("Failed to remove existing package directory: {}", e))?;
+    }
+    fs::create_dir_all(&local_pkg_path).map_err(|e| format!("Failed to create package directory: {}", e))?;
+
+    for item in contents {
+        let name = match item.get("name").and_then(JsonValue::as_str) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        let item_type = item.get("type").and_then(JsonValue::as_str).unwrap_or("");
+
+        if item_type == "file" {
+            let download_url = match item.get("download_url").and_then(JsonValue::as_str) {
+                Some(url) => url,
+                None => {
+                    eprintln!("{}", format!("File '{}' has no download_url", name).red());
+                    continue;
+                }
+            };
+
+            if verbose {
+                println!("{}", format!("Downloading file {}", name));
+            }
+
+            let file_resp = client.get(download_url)
+                .header("User-Agent", "lym-install")
+                .send()
+                .map_err(|e| format!("Failed to download file {}: {}", name, e))?;
+
+            if !file_resp.status().is_success() {
+                eprintln!("{}", format!("Failed to download file {}: HTTP {}", name, file_resp.status()).red());
+                continue;
+            }
+
+            let file_bytes = file_resp.bytes()
+                .map_err(|e| format!("Failed to read bytes of file {}: {}", name, e))?;
+
+            let local_file_path = local_pkg_path.join(name);
+            fs::write(&local_file_path, &file_bytes)
+                .map_err(|e| format!("Failed to write file {}: {}", local_file_path.display(), e))?;
+        }
+        else if item_type == "dir" {
+            let sub_dir = local_pkg_path.join(name);
+            fs::create_dir_all(&sub_dir)
+                .map_err(|e| format!("Failed to create directory {}: {}", sub_dir.display(), e))?;
+        }
+    }
+
+    if verbose {
+        println!("{}", format!("Package '{}' installed successfully.", pkg_name).bright_green());
+    }
+
+    Ok(())
+}
+
 fn install(args: &[String]) {
-    todo!();
+    use dialoguer::Confirm;
+
+    let mut no_confirm = false;
+    let mut verbose = false;
+
+    // Separate package names (before flags) and flags (starting with '-')
+    let mut packages = Vec::new();
+    let mut flags = Vec::new();
+
+    let mut flag_mode = false;
+    for arg in args {
+        if flag_mode || arg.starts_with('-') {
+            flag_mode = true;
+            flags.push(arg.clone());
+        } else {
+            packages.push(arg.clone());
+        }
+    }
+
+    // Parse flags
+    for arg in &flags {
+        match arg.as_str() {
+            "--no-confirm" => no_confirm = true,
+            "-v" => verbose = true,
+            "--help" | "-h" => {
+                command_help("install");
+                return;
+            }
+            _ => {
+                eprintln!("{}", format!("Unknown argument: '{}'", arg).red());
+                command_help("install");
+                return;
+            }
+        }
+    }
+
+    if packages.is_empty() {
+        eprintln!("{}", "You must specify at least one package to install.".red());
+        command_help("install");
+        return;
+    }
+
+    for pkg_name in packages {
+        if verbose {
+            println!("{}", format!("Installing package '{}'", pkg_name).bright_green());
+        }
+
+        if let Err(e) = install_single_package(&pkg_name, no_confirm, verbose) {
+            eprintln!("{}", format!("Failed to install '{}': {}", pkg_name, e).red());
+        }
+    }
 }
 
 fn list(args: &[String]) {
@@ -175,6 +455,7 @@ fn list(args: &[String]) {
     let mut show_ver = true;
     let mut list_remote = false;
     let mut list_local = true;
+    let mut show_std = true;
 
     for arg in args {
         match arg.as_str() {
@@ -188,7 +469,16 @@ fn list(args: &[String]) {
                 list_local = true;
                 list_remote = false;
             }
-            _ => {}
+            "--no-std" => show_std = false,
+            "--help" | "-h" => {
+                command_help("list");
+                return;
+            }
+            _ => {
+                eprintln!("{}", format!("Unknown argument: '{}'", arg).red());
+                command_help("list");
+                return;
+            }
         }
     }
 
@@ -215,7 +505,12 @@ fn list(args: &[String]) {
         }
 
         let lucia_path = Path::new(lucia_path_str.unwrap());
-        let libs_dir = lucia_path.parent().unwrap_or(lucia_path).parent().unwrap_or(lucia_path).join("libs");
+
+        let libs_dir = lucia_path
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(lucia_path)
+            .join("libs");
 
         if !libs_dir.exists() || !libs_dir.is_dir() {
             eprintln!("{}", format!("libs directory not found at {}", libs_dir.display()).red());
@@ -224,43 +519,74 @@ fn list(args: &[String]) {
 
         println!("{}", "Local modules:".bright_green().bold());
 
+        let mut found_any = false;
+
         for entry in fs::read_dir(&libs_dir).unwrap() {
             if let Ok(entry) = entry {
                 let path = entry.path();
+
+                let module_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("<unknown>");
+
+                let is_std = STD_LIBS.contains_key(module_name)
+                    || module_name == "std"
+                    || module_name == "requests";
+
+                if !show_std && is_std {
+                    continue;
+                }
+
+                found_any = true;
+
+                let mut version: Option<String> = None;
+                let mut description: Option<String> = None;
+
                 if path.is_dir() {
-                    let has_init_rs = path.join("__init__.rs").exists();
-
-                    if has_init_rs {
-                        println!("  {} {}", path.file_name().unwrap().to_string_lossy().bright_blue().bold(), "[standard lib]".bright_magenta());
-                        continue;
-                    }
-
                     let manifest_path = path.join("manifest.json");
                     if manifest_path.exists() {
-                        let manifest_str = fs::read_to_string(&manifest_path).unwrap_or_default();
-                        if let Ok(manifest_json) = serde_json::from_str::<JsonValue>(&manifest_str) {
-                            let version = manifest_json.get("version").and_then(JsonValue::as_str).unwrap_or("unknown");
-                            let desc = manifest_json.get("description").and_then(JsonValue::as_str).unwrap_or("");
-                            let mut line = format!("  {}", path.file_name().unwrap().to_string_lossy().bright_cyan());
-                            if show_ver {
-                                line += &format!(" v{}", version);
+                        if let Ok(manifest_str) = fs::read_to_string(&manifest_path) {
+                            if let Ok(manifest_json) = serde_json::from_str::<JsonValue>(&manifest_str) {
+                                version = manifest_json.get("version").and_then(JsonValue::as_str).map(|s| s.to_string());
+                                description = manifest_json.get("description").and_then(JsonValue::as_str).map(|s| s.to_string());
                             }
-                            if show_desc && !desc.is_empty() {
-                                line += &format!(" - {}", desc);
-                            }
-                            println!("{}", line);
-                            continue;
                         }
                     }
-
-                    println!("  {}", path.file_name().unwrap().to_string_lossy().bright_cyan());
-                } else {
-                    let filename = path.file_name().unwrap().to_string_lossy();
-                    if filename.ends_with(".lc") || filename.ends_with(".lucia") {
-                        println!("  {}", filename.bright_cyan());
+                } else if path.is_file() {
+                    if module_name.ends_with(".lc") || module_name.ends_with(".lucia") {
+                        version = None;
+                        description = None;
                     }
                 }
+
+                if is_std {
+                    if let Some(std_info) = STD_LIBS.get(module_name) {
+                        description = Some(std_info.description.to_string());
+                        version = Some(std_info.version.to_string());
+                    }
+                }
+
+                let mut line = if is_std {
+                    format!("  {} {}", module_name.bright_blue().bold(), "[standard lib]".purple())
+                } else {
+                    format!("  {}", module_name.bright_cyan())
+                };
+
+                if show_ver {
+                    line += &format!(" v{}", version.as_deref().unwrap_or("unknown"));
+                }
+                if show_desc {
+                    if let Some(desc) = &description {
+                        if !desc.is_empty() {
+                            line += &format!(" - {}", desc);
+                        }
+                    }
+                }
+
+                println!("{}", line);
             }
+        }
+
+        if !found_any {
+            println!("{}", "No local modules found ".yellow());
         }
     }
 
@@ -299,11 +625,15 @@ fn list(args: &[String]) {
                 if let Ok(contents) = contents {
                     println!("{}", "Remote modules:".bright_green().bold());
 
+                    let mut found_any = false;
+
                     for item in contents {
                         let name = item.get("name").and_then(JsonValue::as_str).unwrap_or("");
                         let item_type = item.get("type").and_then(JsonValue::as_str).unwrap_or("");
 
                         if item_type == "dir" {
+                            found_any = true;
+
                             let manifest_url = format!("https://api.github.com/repos/{}/contents/libs/{}/manifest.json", repo_slug, name);
 
                             let manifest_resp = client.get(&manifest_url)
@@ -338,9 +668,14 @@ fn list(args: &[String]) {
                             println!("  {}", name.bright_cyan());
                         } else if item_type == "file" {
                             if name.ends_with(".lc") || name.ends_with(".lucia") {
+                                found_any = true;
                                 println!("  {}", name.bright_cyan());
                             }
                         }
+                    }
+
+                    if !found_any {
+                        println!("{}", "No remote modules found".yellow());
                     }
                 } else {
                     eprintln!("{}", "Failed to parse GitHub API response.".red());
