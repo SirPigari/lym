@@ -1,6 +1,7 @@
 # Lym
 
 **Lym** is a package/module manager for [Lucia Programming Language](https://github.com/SirPigari/lucia-rust) made in [Rust](https://rust-lang.org)
+Lym comes preinstalled with [Lucia](https://github.com/SirPigari/lucia-rust).
 
 ## Commands
 
