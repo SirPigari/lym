@@ -1,0 +1,6 @@
+{
+    "name": "sha256",
+    "version": "2.5.6",
+    "required_lucia_version": "^2.0.0",
+    "description": "Lucia package for computing SHA-256 hashes."
+}
