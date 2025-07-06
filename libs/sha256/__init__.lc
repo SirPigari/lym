@@ -15,3 +15,11 @@ final fun hash_file(file_path: str) -> str:
     file_content: str = fs.read_file(file_path)
     return hash(file_content)
 end
+
+final fun hash_bytes(input_bytes: list[int]) -> str:
+    input_str: str = ""
+    for (b in input_bytes):
+        input_str += char(b)
+    end
+    return collections.sha256(input_str)
+end

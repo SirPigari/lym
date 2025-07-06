@@ -1,7 +1,9 @@
 # Lym
 
 **Lym** is a package/module manager for [Lucia Programming Language](https://github.com/SirPigari/lucia-rust) made in [Rust](https://rust-lang.org)  
-Lym comes preinstalled with [Lucia](https://github.com/SirPigari/lucia-rust).
+Lym comes preinstalled with [Lucia](https://github.com/SirPigari/lucia-rust).  
+
+Not to confuse *lym* with *lymphoma*  
 
 ## Commands
 
@@ -55,8 +57,9 @@ print(sha256.hash("Hello world!"))
 ## Adding a Package
 
 1. Create your package, making sure it includes a valid [manifest.json](#manifest) file in the root directory.  
-2. Submit a pull request with your package to the repository for review.  
-3. Once approved, your package will be added and available for everyone.
+2. Put the package in the [libs](./libs/) directory.
+3. Submit a pull request with your package to the repository for review.  
+4. Once approved, your package will be added and available for everyone.
 
 ## Manifest
 
