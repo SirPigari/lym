@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 fn version_to_tuple(v: &str) -> Option<(u64, u64, u64)> {
     let parts: Vec<&str> = v.split('.').collect();
     if parts.len() != 3 {
@@ -9,8 +11,7 @@ fn version_to_tuple(v: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
-fn cmp_version(a: (u64,u64,u64), b: (u64,u64,u64)) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
+fn cmp_version(a: (u64,u64,u64), b: (u64,u64,u64)) -> Ordering {
     if a.0 != b.0 {
         return a.0.cmp(&b.0);
     }

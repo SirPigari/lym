@@ -1,151 +1,17 @@
 // SHA-256 Hashing Library for Lucia
 // This library provides functions to compute SHA-256 hashes of strings.
 
-final K: list = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
-    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
-    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
-    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
-    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-]
+import collections
+import fs
 
-final fun rotr(value: int, bits: int) -> int:
-    return (value rshift bits) bor (value lshift (32 - bits)) band 0xFFFFFFFF
+final fun hash(input: str) -> str:
+    return collections.sha256(input)
 end
 
-final fun sha256_ch(x: int, y: int, z: int) -> int:
-    return (x band y) xor ((bnot x) band z)
-end
-
-final fun sha256_maj(x: int, y: int, z: int) -> int:
-    return (x band y) xor (x band z) xor (y band z)
-end
-
-final fun sha256_sigma0(x: int) -> int:
-    return rotr(x, 2) xor rotr(x, 13) xor rotr(x, 22)
-end
-
-final fun sha256_sigma1(x: int) -> int:
-    return rotr(x, 6) xor rotr(x, 11) xor rotr(x, 25)
-end
-
-final fun sha256_delta0(x: int) -> int:
-    return rotr(x, 7) xor rotr(x, 18) xor (x rshift 3)
-end
-
-final fun sha256_delta1(x: int) -> int:
-    return rotr(x, 17) xor rotr(x, 19) xor (x rshift 10)
-end
-
-final fun padMessage(message: list) -> list:
-    length: int = len(message)
-    bitLength: int = length * 8
-    message = message.append(0x80)
-
-    while (((len(message) * 8) band 511) != 448):
-        message = message.append(0)
+final fun hash_file(file_path: str) -> str:
+    if (not fs.file_exists(file_path)):
+        throw "File not found: " + file_path from "FileNotFoundError"
     end
-
-    for (i in [7..0]):
-        message = message.append((bitLength rshift (i * 8)) band 0xFF)
-    end
-
-    return message
+    file_content: str = fs.read_file(file_path)
+    return hash(file_content)
 end
-
-final fun toWords(chunk: list) -> list:
-    words: list = []
-
-    for (i in [0..15]):
-        word: int = 0
-        for (j in [0..3]):
-            word = (word lshift 8) bor chunk[i * 4 + j]
-        end
-        words = words.append(word)
-    end
-
-    for (i in [16..63]):
-        s0: int = sha256_delta0(words[i - 15])
-        s1: int = sha256_delta1(words[i - 2])
-        val: int = (words[i - 16] + s0 + words[i - 7] + s1) band 0xFFFFFFFF
-        words = words.append(val)
-    end
-
-    return words
-end
-
-final fun intToHex(value: int) -> str:
-    hexStr: str = ""
-    hexChars: str = "0123456789abcdef"
-    for (i in [7..0]):
-        hexStr += hexChars[(value rshift (i * 4)) band 0xF]
-    end
-    return hexStr
-end
-
-final fun sha256(messageStr: str) -> str:
-    message: list = []
-    for (c in messageStr):
-        message = message.append(ord(c))
-    end
-    message = padMessage(message)
-
-    h0: int = 0x6a09e667
-    h1: int = 0xbb67ae85
-    h2: int = 0x3c6ef372
-    h3: int = 0xa54ff53a
-    h4: int = 0x510e527f
-    h5: int = 0x9b05688c
-    h6: int = 0x1f83d9ab
-    h7: int = 0x5be0cd19
-
-    for (chunkStart in [0, 64..; len(message)]):
-        chunk: list = message[chunkStart..chunkStart+64]
-        w: list = toWords(chunk)
-
-        (a, b, c, d, e, f, g, h) = (h0, h1, h2, h3, h4, h5, h6, h7)
-
-        for (i in [0...63]):
-            T1: int = (h + sha256_sigma1(e) + sha256_ch(e, f, g) + K[i] + w[i]) band 0xFFFFFFFF
-            T2: int = (sha256_sigma0(a) + sha256_maj(a, b, c)) band 0xFFFFFFFF
-            h = g
-            g = f
-            f = e
-            e = (d + T1) band 0xFFFFFFFF
-            d = c
-            c = b
-            b = a
-            a = (T1 + T2) band 0xFFFFFFFF
-        end
-
-        h0 = (h0 + a) band 0xFFFFFFFF
-        h1 = (h1 + b) band 0xFFFFFFFF
-        h2 = (h2 + c) band 0xFFFFFFFF
-        h3 = (h3 + d) band 0xFFFFFFFF
-        h4 = (h4 + e) band 0xFFFFFFFF
-        h5 = (h5 + f) band 0xFFFFFFFF
-        h6 = (h6 + g) band 0xFFFFFFFF
-        h7 = (h7 + h) band 0xFFFFFFFF
-    end
-
-    return intToHex(h0) + intToHex(h1) + intToHex(h2) + intToHex(h3) + intToHex(h4) + intToHex(h5) + intToHex(h6) + intToHex(h7)
-end
-
-final fun hash(message: str) -> str:
-    return sha256(message)
-end
-
-
-hash("Hello world!")
-// Output: "a591a6d40bf420404a011733cfb7

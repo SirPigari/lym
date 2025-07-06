@@ -6,6 +6,7 @@ Lym comes preinstalled with [Lucia](https://github.com/SirPigari/lucia-rust).
 ## Commands
 
 `lym`  
+
 - **install** `[package_name] [--no-confirm] [-v] [--help]`  
   Installs one or more packages. Use `--no-confirm` to skip prompts, `-v` for verbose output, or `--help` for usage info.
 
@@ -34,6 +35,7 @@ Lym comes preinstalled with [Lucia](https://github.com/SirPigari/lucia-rust).
   Creates a new package or module at the given path.
 
 ## Example
+
 Let's say you want to install the **sha256** package.  
 First you do:
 
@@ -56,12 +58,12 @@ print(sha256.hash("Hello world!"))
 2. Submit a pull request with your package to the repository for review.  
 3. Once approved, your package will be added and available for everyone.
 
-
 ## Manifest
 
 Manifest is a manifest.json file in the root directory of the package.
 
 it should have:
+
 ```json
 {
     "name": "package",

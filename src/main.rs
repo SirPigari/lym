@@ -1,7 +1,3 @@
-#![allow(unused_imports)]
-#![allow(dead_code)]
-#![allow(unused_variables)]
-
 use colored::*;
 use std::env;
 use std::fs::{self, File};
@@ -9,18 +5,16 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
 use indicatif::{ProgressBar, ProgressStyle, self};
-use dialoguer::{Input, Select, Confirm, theme, self};
+use dialoguer::{Confirm, self};
 use std::time::Duration;
-use serde::{Serialize, Deserialize};
 use serde_json::{Value as JsonValue, json};
 use reqwest::blocking::Client;
 use base64::{engine::general_purpose, Engine as _};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 mod db;
 mod utils;
 
-use db::{LibInfo, STD_LIBS};
+use db::STD_LIBS;
 use utils::check_version;
 
 // lym - Lucia package manager
@@ -655,8 +649,6 @@ fn move_packages(args: &[String], disable: bool) {
 }
 
 fn install(args: &[String]) {
-    use dialoguer::Confirm;
-
     let mut no_confirm = false;
     let mut verbose = false;
 
@@ -945,7 +937,7 @@ fn list(args: &[String]) {
             return;
         }
 
-        let repo_url = repo_url.unwrap();
+        let _repo_url = repo_url.unwrap();
 
         let repo_slug = config_json.get("repository_slug").and_then(JsonValue::as_str);
         if repo_slug.is_none() {
@@ -1472,7 +1464,7 @@ fn config(args: &[String]) {
                             format!("Lucia UUID changed from '{}' to '{}'", old.bold(), new.bold()).blue()
                         );
                     }
-                    (Some(old), Some(new)) => {
+                    (Some(old), Some(_new)) => {
                         println!("{}", format!("Lucia UUID remained '{}'", old.bold()).blue());
                     }
                     _ => {
@@ -1882,11 +1874,6 @@ fn main() {
             exit(1);
         }
     }
-
-    let config_json: JsonValue = fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|data| serde_json::from_str(&data).ok())
-        .unwrap_or_else(|| json!({}));
 
     let mut args: Vec<String> = env::args().collect();
     if args.len() > 0 {

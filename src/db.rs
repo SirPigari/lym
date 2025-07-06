@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use once_cell::sync::Lazy;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct LibInfo {
     pub description: &'static str,

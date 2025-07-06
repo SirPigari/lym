@@ -1,3 +1,4 @@
 /target
 lym.exe
 Cargo.lock
+.vscode/
