@@ -50,20 +50,45 @@ it should have:
     "version": "0.1.0",
     "required_lucia_version": "^2.0.0",
     "description": "description",
-    "license": "MIT", // optional license field
+    "license": "MIT",
     "authors": [
-        // list of authors (optional)
+        "your name"
     ],
     "config": {
-        // keys that must be enabled in the lucia config for this package to work
+        "use_preprocessor": true,
     },
     "dependencies" {
-        // deps needed, eg.: "package2": "^3.69.42"
+        "package2": "^3.69.42"
     }
 }
 ```
 
-Authors, config, license and dependencies are optional.
+### Field Descriptions
+
+- **name** (string, required)  
+  The package’s name.
+
+- **version** (string, required)  
+  The package’s version in [semver](https://semver.org/) format.
+
+- **required_lucia_version** (string, required)  
+  The minimum compatible version of Lucia required to use this package.
+
+- **description** (string, required)  
+  A short description of what the package does.
+
+- **license** (string, optional)  
+  The license type for the package (e.g., MIT, GPL).
+
+- **authors** (array of strings, optional)  
+  List of package authors.
+
+- **config** (object, optional)  
+  Keys that must be enabled in the Lucia config for this package to work properly.
+
+- **dependencies** (object, optional)  
+  Package dependencies with version requirements, e.g., `"package2": "^3.69.42"`.
+
 
 ## LICENSE
 
