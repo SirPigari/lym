@@ -23,6 +23,10 @@ mod utils;
 use db::{LibInfo, STD_LIBS};
 use utils::check_version;
 
+// lym - Lucia package manager
+// 'lym' isnt an acronym if you were wondering
+// (maybe its lymphoma idk)
+
 fn get_lym_dir() -> io::Result<PathBuf> {
     let home_dir = dirs::home_dir().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Could not find home directory"))?;
     let lym_dir = home_dir.join(".lym");
@@ -44,6 +48,10 @@ fn ensure_lym_dirs() -> io::Result<()> {
     let logs_dir = lym_dir.join("logs");
     if !logs_dir.exists() {
         fs::create_dir_all(&logs_dir)?;
+    }
+    let store_dir = lym_dir.join("store");
+    if !store_dir.exists() {
+        fs::create_dir_all(&store_dir)?;
     }
 
     Ok(())
@@ -153,7 +161,7 @@ fn update_config_with_lucia_info(config_path: &Path) -> io::Result<()> {
 
 fn print_help() {
     println!(
-        "{} - {}\n\n{}:\n  {} <command> [args]\n\n{}:\n  {}   Install a package\n  {}      List installed packages\n  {}  Download a package\n  {}    Remove a package\n  {}   Disable a package\n  {}    Enable a package\n  {}    Set configuration options (lucia or lym)\n  {}     Modify package manifest\n  {}       Create a new package\n\n{} 'lym <command> --help' {} for more info on a command.\n",
+        "{} - {}\n\n{}:\n  {} <command> [args]\n\n{}:\n  {}   Install a package\n  {}      List installed packages\n  {}  Download a package\n  {}    Remove a package\n  {}   Disable a package\n  {}    Enable a package\n  {}    Set configuration options (lucia or lym)\n  {}    Modify package manifest\n  {}       Create a new package\n\n{} 'lym <command> --help' {} for more info on a command.\n",
         "lym".bright_blue().bold(),
         "Lucia package manager".bright_white(),
         "Usage".bright_green().bold(),
@@ -181,7 +189,7 @@ fn command_help(cmd: &str) {
                 "Usage:".bright_green().bold(),
                 "lym".bright_cyan().bold(),
                 "list".bright_cyan(),
-                "[--remote | --local] [--no-desc] [--no-ver] [--no-std]".bright_yellow(),
+                "[--remote | --local | --store] [--no-desc] [--no-ver] [--no-std] [--help]".bright_yellow(),
                 "Lists installed packages or remote packages.".bright_white()
             );
         }
@@ -193,6 +201,76 @@ fn command_help(cmd: &str) {
                 "install".bright_cyan(),
                 "[package_name] [--no-confirm] [-v] [--help]".bright_yellow(),
                 "Installs a package from the remote repository.".bright_white()
+            );
+        }
+        "remove" => {
+            println!(
+                "{} {} {} {}\n\n{}",
+                "Usage:".bright_green().bold(),
+                "lym".bright_cyan().bold(),
+                "remove".bright_cyan(),
+                "[package_name] [--no-confirm] [-v] [--help]".bright_yellow(),
+                "Removes a package from the local installation.".bright_white()
+            );
+        }
+        "disable" => {
+            println!(
+                "{} {} {} {}\n\n{}",
+                "Usage:".bright_green().bold(),
+                "lym".bright_cyan().bold(),
+                "disable".bright_cyan(),
+                "[package_name] [--no-confirm] [-v] [--help]".bright_yellow(),
+                "Disables a package, moving it to the store directory.".bright_white()
+            );
+        }
+        "enable" => {
+            println!(
+                "{} {} {} {}\n\n{}",
+                "Usage:".bright_green().bold(),
+                "lym".bright_cyan().bold(),
+                "enable".bright_cyan(),
+                "[package_name] [--no-confirm] [-v] [--help]".bright_yellow(),
+                "Enables a package, moving it back to the libs directory.".bright_white()
+            );
+        }
+        "download" => {
+            println!(
+                "{} {} {} {}\n\n{}",
+                "Usage:".bright_green().bold(),
+                "lym".bright_cyan().bold(),
+                "download".bright_cyan(),
+                "[package_name] [output_path] [--no-confirm] [-v] [--help]".bright_yellow(),
+                "Downloads a package from the remote repository.".bright_white()
+            );
+        }
+        "config" => {
+            println!(
+                "{} {} {} {}\n\n{}",
+                "Usage:".bright_green().bold(),
+                "lym".bright_cyan().bold(),
+                "config".bright_cyan(),
+                "[ lym | lucia | fetch ] [--set <key=value>] [--get <key>] [--help] [--no-confirm]".bright_yellow(),
+                "Sets or gets configuration options for lym or lucia.".bright_white()
+            );
+        }
+        "modify" => {
+            println!(
+                "{} {} {} {}\n\n{}",
+                "Usage:".bright_green().bold(),
+                "lym".bright_cyan().bold(),
+                "modify".bright_cyan(),
+                "[package_name] [--stored] <key> [value1 [value2 ...]] [--no-confirm] [--help]".bright_yellow(),
+                "Modifies the manifest.json of a package.".bright_white()
+            );
+        }
+        "new" => {
+            println!(
+                "{} {} {} {}\n\n{}",
+                "Usage:".bright_green().bold(),
+                "lym".bright_cyan().bold(),
+                "new".bright_cyan(),
+                "[package | module] [name] [path] [--no-confirm] [--help] [--main-file:<name>]".bright_yellow(),
+                "Creates a new package/module with a basic manifest.json.".bright_white()
             );
         }
         _ => {
@@ -249,6 +327,10 @@ fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Re
         }
     }
 
+    let fetch_pb = ProgressBar::new_spinner();
+    fetch_pb.set_message("Fetching manifest.json...");
+    fetch_pb.enable_steady_tick(Duration::from_millis(100));
+
     let manifest_url = format!("https://api.github.com/repos/{}/contents/libs/{}/manifest.json", repo_slug, pkg_name);
     let client = Client::builder()
         .timeout(Duration::from_secs(5))
@@ -259,6 +341,8 @@ fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Re
         .header("User-Agent", "lym-install")
         .send()
         .map_err(|e| format!("Failed to send request: {}", e))?;
+
+    fetch_pb.finish_and_clear();
 
     if !resp.status().is_success() {
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -294,7 +378,7 @@ fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Re
         .unwrap_or("0.0.0");
 
     if verbose {
-        println!("{}", format!("Checking lucia version: required '{}' vs current '{}'", required_version, current_version));
+        println!("{}", format!("Checking lucia version: required '{}' vs current '{}'", required_version.to_string().bright_green(), current_version.to_string().bright_green()));
     }
 
     if !check_version(current_version, required_version) {
@@ -337,17 +421,31 @@ fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Re
     }
 
     if local_pkg_path.exists() {
-        if verbose {
-            println!("{}", format!("Removing existing package directory {}", local_pkg_path.display()));
-        }
+        let del_pb = ProgressBar::new_spinner();
+        del_pb.set_message(format!("Removing existing package directory {}", local_pkg_path.display()));
+        del_pb.enable_steady_tick(Duration::from_millis(100));
+
         fs::remove_dir_all(&local_pkg_path).map_err(|e| format!("Failed to remove existing package directory: {}", e))?;
+
+        del_pb.finish_with_message("Existing package directory removed");
     }
     fs::create_dir_all(&local_pkg_path).map_err(|e| format!("Failed to create package directory: {}", e))?;
+
+    let pb = ProgressBar::new(contents.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
 
     for item in contents {
         let name = match item.get("name").and_then(JsonValue::as_str) {
             Some(n) => n,
-            None => continue,
+            None => {
+                pb.inc(1);
+                continue;
+            },
         };
 
         let item_type = item.get("type").and_then(JsonValue::as_str).unwrap_or("");
@@ -357,12 +455,13 @@ fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Re
                 Some(url) => url,
                 None => {
                     eprintln!("{}", format!("File '{}' has no download_url", name).red());
+                    pb.inc(1);
                     continue;
                 }
             };
 
             if verbose {
-                println!("{}", format!("Downloading file {}", name));
+                pb.set_message(format!("Downloading file {}", name));
             }
 
             let file_resp = client.get(download_url)
@@ -372,6 +471,7 @@ fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Re
 
             if !file_resp.status().is_success() {
                 eprintln!("{}", format!("Failed to download file {}: HTTP {}", name, file_resp.status()).red());
+                pb.inc(1);
                 continue;
             }
 
@@ -387,13 +487,171 @@ fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Re
             fs::create_dir_all(&sub_dir)
                 .map_err(|e| format!("Failed to create directory {}: {}", sub_dir.display(), e))?;
         }
+        pb.inc(1);
     }
+    pb.finish_with_message("Download complete");
 
-    if verbose {
-        println!("{}", format!("Package '{}' installed successfully.", pkg_name).bright_green());
-    }
+    println!("{}", format!("Package '{}' installed successfully.", pkg_name.bright_cyan()).bright_green());
 
     Ok(())
+}
+
+fn move_packages(args: &[String], disable: bool) {
+    let no_confirm = args.iter().any(|a| a == "--no-confirm");
+    let verbose = args.iter().any(|a| a == "-v");
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        let cmd_name = if disable { "disable" } else { "enable" };
+        command_help(cmd_name);
+        return;
+    }
+
+    let pkgs: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+
+    if pkgs.is_empty() {
+        eprintln!("{}", "Error: no packages specified".red());
+        exit(1);
+    }
+
+    let lym_dir = match get_lym_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{}", format!("Failed to get lym dir: {}", e).red());
+            exit(1);
+        }
+    };
+
+    let config_path = lym_dir.join("config.json");
+    let config_json: JsonValue = match fs::read_to_string(&config_path)
+        .map_err(|e| format!("Failed to read config.json: {}", e))
+        .and_then(|data| serde_json::from_str(&data).map_err(|e| format!("Invalid config.json: {}", e)))
+    {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("{}", e.red());
+            exit(1);
+        }
+    };
+
+    let lucia_path_str = config_json.get("lucia_path")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_else(|| {
+            eprintln!("{}", "Lucia path not set in config.".red());
+            exit(1);
+        });
+
+    let lucia_path = Path::new(lucia_path_str);
+
+    let libs_dir = lucia_path
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(lucia_path)
+        .join("libs");
+
+    let store_dir = lym_dir.join("store");
+
+    if !store_dir.exists() {
+        if let Err(e) = fs::create_dir_all(&store_dir) {
+            eprintln!("{}", format!("Failed to create store dir: {}", e).red());
+            exit(1);
+        }
+    }
+
+    let mut valid_moves = vec![];
+
+    for pkg_name in &pkgs {
+        let (src_dir, dest_dir) = if disable {
+            (libs_dir.join(pkg_name), store_dir.join(pkg_name))
+        } else {
+            (store_dir.join(pkg_name), libs_dir.join(pkg_name))
+        };
+
+        if !src_dir.exists() {
+            if verbose {
+                eprintln!("{}", format!("Skipping '{}': not found at {}", pkg_name, src_dir.display()).yellow());
+            }
+            continue;
+        }
+
+        let is_std = STD_LIBS.contains_key(pkg_name.as_str()) || *pkg_name == "std" || *pkg_name == "requests";
+
+        if is_std && disable {
+            // [Intentional Game Design]
+            let cont = Confirm::new()
+                .with_prompt(format!("'{}' is a standard library package. Disable anyway?", pkg_name.bright_cyan()))
+                .default(false)
+                .interact()
+                .unwrap_or(false);
+
+            if !cont {
+                if verbose {
+                    println!("{}", format!("Skipping '{}'", pkg_name).yellow());
+                }
+                continue;
+            }
+        }
+
+        if is_std && !disable && !no_confirm {
+            let cont = Confirm::new()
+                .with_prompt(format!("Re-enabling stdlib package '{}'. Proceed?", pkg_name))
+                .default(true)
+                .interact()
+                .unwrap_or(false);
+
+            if !cont {
+                if verbose {
+                    println!("{}", format!("Skipping '{}'", pkg_name).yellow());
+                }
+                continue;
+            }
+        }
+
+        valid_moves.push((pkg_name, src_dir, dest_dir));
+    }
+
+    if valid_moves.is_empty() {
+        eprintln!("{}", "No valid packages to process.".bright_red());
+        for pkg_name in &pkgs {
+            let is_std = STD_LIBS.contains_key(pkg_name.as_str());
+            let (src_dir, _) = if disable {
+                (libs_dir.join(pkg_name), store_dir.join(pkg_name))
+            } else {
+                (store_dir.join(pkg_name), libs_dir.join(pkg_name))
+            };
+    
+            if !src_dir.exists() {
+                eprintln!("{}", format!("'{}' not found at {}", pkg_name, src_dir.display()).bright_red());
+            } else if disable && is_std {
+                eprintln!("{}", format!("'{}' is a standard library package — skipping disable (no confirm)", pkg_name).bright_red());
+            } else if !disable && is_std {
+                eprintln!("{}", format!("'{}' is a standard library package — skipping enable (no confirm)", pkg_name).bright_red());
+            } else {
+                eprintln!("{}", format!("'{}' was skipped", pkg_name).bright_red());
+            }
+        }
+        exit(1);
+    }    
+
+    let pb = ProgressBar::new(valid_moves.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    pb.enable_steady_tick(Duration::from_millis(100));
+
+    for (pkg_name, src_dir, dest_dir) in valid_moves {
+        pb.set_message(format!("Moving '{}'", pkg_name));
+        if let Err(e) = fs::rename(&src_dir, &dest_dir) {
+            pb.println(format!("{}", format!("Failed to move '{}': {}", pkg_name, e).red()));
+        } else if verbose {
+            pb.println(format!("{}", format!("Moved '{}'", pkg_name).green()));
+        }
+        pb.inc(1);
+    }
+
+    pb.finish_with_message("Move complete");
 }
 
 fn install(args: &[String]) {
@@ -402,7 +660,6 @@ fn install(args: &[String]) {
     let mut no_confirm = false;
     let mut verbose = false;
 
-    // Separate package names (before flags) and flags (starting with '-')
     let mut packages = Vec::new();
     let mut flags = Vec::new();
 
@@ -416,7 +673,6 @@ fn install(args: &[String]) {
         }
     }
 
-    // Parse flags
     for arg in &flags {
         match arg.as_str() {
             "--no-confirm" => no_confirm = true,
@@ -441,7 +697,7 @@ fn install(args: &[String]) {
 
     for pkg_name in packages {
         if verbose {
-            println!("{}", format!("Installing package '{}'", pkg_name).bright_green());
+            println!("Installing package '{}'", pkg_name.bright_cyan());
         }
 
         if let Err(e) = install_single_package(&pkg_name, no_confirm, verbose) {
@@ -455,6 +711,7 @@ fn list(args: &[String]) {
     let mut show_ver = true;
     let mut list_remote = false;
     let mut list_local = true;
+    let mut list_store = false;
     let mut show_std = true;
 
     for arg in args {
@@ -462,11 +719,18 @@ fn list(args: &[String]) {
             "--remote" => {
                 list_remote = true;
                 list_local = false;
+                list_store = false;
             }
             "--no-desc" => show_desc = false,
             "--no-ver" => show_ver = false,
             "--local" => {
                 list_local = true;
+                list_remote = false;
+                list_store = false;
+            }
+            "--store" => {
+                list_store = true;
+                list_local = false;
                 list_remote = false;
             }
             "--no-std" => show_std = false,
@@ -590,6 +854,90 @@ fn list(args: &[String]) {
         }
     }
 
+    if list_store {
+        let store_dir = lym_dir.join("store");
+    
+        if !store_dir.exists() || !store_dir.is_dir() {
+            eprintln!("{}", format!("store directory not found at {}", store_dir.display()).red());
+            return;
+        }
+    
+        println!("{}", "Stored (disabled) modules:".bright_green().bold());
+    
+        let mut found_any = false;
+    
+        for entry in fs::read_dir(&store_dir).unwrap_or_else(|_| {
+            eprintln!("{}", format!("Failed to read store dir at {}", store_dir.display()).red());
+            exit(1);
+        }) {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+    
+                let module_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("<unknown>");
+    
+                let is_std = STD_LIBS.contains_key(module_name)
+                    || module_name == "std"
+                    || module_name == "requests";
+    
+                if !show_std && is_std {
+                    continue;
+                }
+    
+                found_any = true;
+    
+                let mut version: Option<String> = None;
+                let mut description: Option<String> = None;
+    
+                if path.is_dir() {
+                    let manifest_path = path.join("manifest.json");
+                    if manifest_path.exists() {
+                        if let Ok(manifest_str) = fs::read_to_string(&manifest_path) {
+                            if let Ok(manifest_json) = serde_json::from_str::<JsonValue>(&manifest_str) {
+                                version = manifest_json.get("version").and_then(JsonValue::as_str).map(|s| s.to_string());
+                                description = manifest_json.get("description").and_then(JsonValue::as_str).map(|s| s.to_string());
+                            }
+                        }
+                    }
+                } else if path.is_file() {
+                    if module_name.ends_with(".lc") || module_name.ends_with(".lucia") {
+                        version = None;
+                        description = None;
+                    }
+                }
+    
+                if is_std {
+                    if let Some(std_info) = STD_LIBS.get(module_name) {
+                        description = Some(std_info.description.to_string());
+                        version = Some(std_info.version.to_string());
+                    }
+                }
+    
+                let mut line = if is_std {
+                    format!("  {} {}", module_name.bright_blue().bold(), "[standard lib]".purple())
+                } else {
+                    format!("  {}", module_name.bright_cyan())
+                };
+    
+                if show_ver {
+                    line += &format!(" v{}", version.as_deref().unwrap_or("unknown"));
+                }
+                if show_desc {
+                    if let Some(desc) = &description {
+                        if !desc.is_empty() {
+                            line += &format!(" - {}", desc);
+                        }
+                    }
+                }
+    
+                println!("{}", line);
+            }
+        }
+    
+        if !found_any {
+            println!("{}", "No stored modules found".yellow());
+        }
+    }
+
     if list_remote {
         let repo_url = config_json.get("repository").and_then(JsonValue::as_str);
         if repo_url.is_none() {
@@ -694,31 +1042,815 @@ fn list(args: &[String]) {
 }
 
 fn download(args: &[String]) {
-    todo!();
+    let mut no_confirm = false;
+    let mut verbose = false;
+
+    let mut positional_args = Vec::new();
+
+    for arg in args {
+        match arg.as_str() {
+            "--no-confirm" => no_confirm = true,
+            "-v" => verbose = true,
+            "--help" | "-h" => {
+                command_help("download");
+                return;
+            }
+            _ if arg.starts_with('-') => {
+                eprintln!("{}", format!("Unknown flag '{}'", arg).red());
+                command_help("download");
+                return;
+            }
+            _ => positional_args.push(arg.clone()),
+        }
+    }
+
+    if positional_args.is_empty() {
+        eprintln!("{}", "You must provide a package name.".red());
+        command_help("download");
+        return;
+    }
+
+    let package_name = &positional_args[0];
+    let output_path = if positional_args.len() >= 2 {
+        PathBuf::from(&positional_args[1])
+    } else {
+        PathBuf::from(format!("./{}/", package_name))
+    };
+
+    let lym_dir = match get_lym_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{}", format!("Failed to get lym dir: {}", e).red());
+            return;
+        }
+    };
+
+    let config_path = lym_dir.join("config.json");
+    let config_json: JsonValue = fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|data| serde_json::from_str(&data).ok())
+        .unwrap_or_else(|| json!({}));
+
+    let repo_slug = match config_json.get("repository_slug").and_then(JsonValue::as_str) {
+        Some(s) => s,
+        None => {
+            eprintln!("{}", "Repository slug not set in config.".red());
+            return;
+        }
+    };
+
+    let api_url = format!(
+        "https://api.github.com/repos/{}/contents/libs/{}",
+        repo_slug, package_name
+    );
+
+    let client = match Client::builder().timeout(Duration::from_secs(5)).build() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{}", format!("Failed to build HTTP client: {}", e).red());
+            return;
+        }
+    };
+
+    let resp = match client.get(&api_url).header("User-Agent", "lym-download").send() {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("{}", "Failed to connect to GitHub API.".red());
+            return;
+        }
+    };
+
+    if !resp.status().is_success() {
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            eprintln!("{}", format!("Package '{}' not found in repository.", package_name).red());
+        } else {
+            eprintln!("{}", format!("GitHub API error: {}", resp.status()).red());
+        }
+        return;
+    }
+
+    let files: Vec<JsonValue> = match resp.json() {
+        Ok(f) => f,
+        Err(_) => {
+            eprintln!("{}", "Failed to parse GitHub API response.".red());
+            return;
+        }
+    };
+
+    if !no_confirm {
+        let confirm = Confirm::new()
+            .with_prompt(format!("Download package '{}' into '{}'", package_name, output_path.display()))
+            .default(true)
+            .interact();
+
+        if let Ok(false) | Err(_) = confirm {
+            println!("{}", "Aborted.".yellow());
+            return;
+        }
+    }
+
+    if output_path.exists() && !output_path.is_dir() {
+        eprintln!("{}", format!("Output path '{}' already exists and is not a directory.", output_path.display()).red());
+        return;
+    }
+
+    if !output_path.exists() {
+        if let Err(e) = fs::create_dir_all(&output_path) {
+            eprintln!("{}", format!("Failed to create output directory '{}': {}", output_path.display(), e).red());
+            return;
+        }
+    }
+
+    for file in files {
+        let name = file.get("name").and_then(JsonValue::as_str).unwrap_or("unknown");
+        let download_url = file.get("download_url").and_then(JsonValue::as_str);
+        if download_url.is_none() {
+            if verbose {
+                eprintln!("{}", format!("Skipping '{}': no download URL", name).red());
+            }
+            continue;
+        }
+
+        let url = download_url.unwrap();
+        let dest_path = output_path.join(name);
+
+        let file_resp = match client.get(url).header("User-Agent", "lym-download").send() {
+            Ok(r) => r,
+            Err(_) => {
+                eprintln!("{}", format!("Failed to download '{}'", name).red());
+                continue;
+            }
+        };
+
+        if !file_resp.status().is_success() {
+            eprintln!("{}", format!("Failed to fetch '{}': {}", name, file_resp.status()).red());
+            continue;
+        }
+
+        let bytes = match file_resp.bytes() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("{}", format!("Failed to read content of '{}'", name).red());
+                continue;
+            }
+        };
+
+        if let Err(e) = fs::write(&dest_path, &bytes) {
+            eprintln!("{}", format!("Failed to write to {}: {}", dest_path.display(), e).red());
+            continue;
+        }
+
+        if verbose {
+            println!("{}", format!("Downloaded '{}'", dest_path.display()).bright_green());
+        }
+    }
+    if verbose {
+        println!("{}", format!("All files downloaded to '{}'", output_path.display()).bright_green());
+    } else {
+        println!("{}", "Download complete.".bright_green());
+    }
 }
 
 fn remove(args: &[String]) {
-    todo!();
+    if args.is_empty() {
+        eprintln!("{}", "Error: No package names provided.".red());
+        command_help("remove");
+        exit(1);
+    }
+
+    let mut verbose = false;
+    let mut no_confirm = false;
+    let mut packages = vec![];
+
+    for arg in args {
+        match arg.as_str() {
+            "-v" | "--verbose" => verbose = true,
+            "--no-confirm" => no_confirm = true,
+            "--help" | "-h" => {
+                command_help("remove");
+                return;
+            }
+            pkg => packages.push(pkg.to_string()),
+        }
+    }
+
+    if packages.is_empty() {
+        eprintln!("{}", "Error: No package names provided after flags.".red());
+        command_help("remove");
+        exit(1);
+    }
+
+    let lym_dir = match get_lym_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("{} {}", "Failed to get lym dir:".red(), e);
+            exit(1);
+        }
+    };
+
+    let config_path = lym_dir.join("config.json");
+    let config_json = match fs::read_to_string(&config_path) {
+        Ok(data) => match serde_json::from_str::<JsonValue>(&data) {
+            Ok(json) => json,
+            Err(e) => {
+                eprintln!("{} {}", "Invalid config.json:".red(), e);
+                exit(1);
+            }
+        },
+        Err(e) => {
+            eprintln!("{} {}", "Failed to read config.json:".red(), e);
+            exit(1);
+        }
+    };
+
+    let lucia_path_str = match config_json.get("lucia_path").and_then(JsonValue::as_str) {
+        Some(path) => path,
+        None => {
+            eprintln!("{}", "Lucia path not set in config. Run lym config or reinstall lucia.".red());
+            exit(1);
+        }
+    };
+
+    let lucia_path = Path::new(lucia_path_str);
+    let libs_dir = lucia_path
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(lucia_path)
+        .join("libs");
+
+    for pkg_name in packages {
+        if STD_LIBS.contains_key(pkg_name.as_str()) || pkg_name == "std" || pkg_name == "requests" {
+            eprintln!("{}",
+                format!("Error: Package '{}' is part of the standard library and cannot be removed.", pkg_name.bright_cyan())
+                    .red()
+            );
+            continue;
+        }
+
+        let local_pkg_path = libs_dir.join(&pkg_name);
+
+        if !local_pkg_path.exists() {
+            if verbose {
+                println!("Package '{}' is not installed, skipping.", pkg_name.bright_cyan());
+            }
+            continue;
+        }
+
+        if !no_confirm {
+            let confirm = match Confirm::new()
+                .with_prompt(format!("Remove package '{}' ? (Y/n)", pkg_name.bright_cyan()))
+                .default(false)
+                .interact()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{} {}", "Prompt error:".red(), e);
+                    exit(1);
+                }
+            };
+
+            if !confirm {
+                if verbose {
+                    println!("Removal of package '{}' cancelled by user.", pkg_name);
+                }
+                continue;
+            }
+        }
+
+        if verbose {
+            println!("Removing package directory {}", local_pkg_path.display());
+        }
+
+        let pb = ProgressBar::new_spinner();
+        pb.set_message(format!("Removing package '{}'", pkg_name.bright_cyan()));
+        pb.enable_steady_tick(Duration::from_millis(100));
+
+        if let Err(e) = fs::remove_dir_all(&local_pkg_path) {
+            pb.finish_and_clear();
+            eprintln!("{} {}", format!("Failed to remove package directory '{}':", local_pkg_path.display()).red(), e);
+            exit(1);
+        }
+
+        pb.finish_with_message(format!("Package '{}' removed", pkg_name));
+    }
 }
 
 fn disable(args: &[String]) {
-    todo!();
+    move_packages(args, true);
 }
 
 fn enable(args: &[String]) {
-    todo!();
+    move_packages(args, false);
 }
 
 fn config(args: &[String]) {
-    todo!();
+    if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
+        command_help("config");
+        return;
+    }
+
+    let target = args[0].as_str();
+    if target != "lym" && target != "lucia" && target != "fetch" {
+        eprintln!("{}", "First argument must be 'lym' or 'lucia'.".red());
+        command_help("config");
+        return;
+    }
+
+    let mut set_pair: Option<(String, String)> = None;
+    let mut get_key: Option<String> = None;
+    let mut no_confirm = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--no-confirm" => {
+                no_confirm = true;
+                i += 1;
+            }
+            "--set" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("{}", "--set requires a <key=value> argument.".red());
+                    return;
+                }
+                let kv = &args[i];
+                if let Some(pos) = kv.find('=') {
+                    let key = kv[..pos].to_string();
+                    let value = kv[pos + 1..].to_string();
+                    set_pair = Some((key, value));
+                } else {
+                    eprintln!("{}", "--set argument must be in key=value format.".red());
+                    return;
+                }
+                i += 1;
+            }
+            "--get" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("{}", "--get requires a <key> argument.".red());
+                    return;
+                }
+                get_key = Some(args[i].clone());
+                i += 1;
+            }
+            _ => {
+                eprintln!("{}", format!("Unknown argument '{}'.", args[i]).red());
+                return;
+            }
+        }
+    }
+
+    if set_pair.is_some() && get_key.is_some() && target != "fetch" {
+        eprintln!("{}", "Cannot use --set and --get together.".red());
+        return;
+    }
+
+    if set_pair.is_none() && get_key.is_none() && target != "fetch" {
+        eprintln!("{}", "You must provide either --set or --get.".red());
+        return;
+    }
+
+    let lym_dir = match get_lym_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{}", format!("Failed to get lym dir: {}", e).red());
+            return;
+        }
+    };
+
+    let config_path = match target {
+        "lucia" => {
+            let main_config_path = lym_dir.join("config.json");
+            let main_config_json: JsonValue = fs::read_to_string(&main_config_path)
+                .ok()
+                .and_then(|data| serde_json::from_str(&data).ok())
+                .unwrap_or_else(|| json!({}));
+
+            let lucia_path_str = match main_config_json.get("lucia_path").and_then(JsonValue::as_str) {
+                Some(p) => p,
+                None => {
+                    eprintln!("{}", "Failed to get lucia path from main config.".red());
+                    return;
+                }
+            };
+
+            let lucia_path = Path::new(lucia_path_str);
+            match lucia_path.parent().and_then(|p| p.parent()) {
+                Some(parent) => parent.join("config.json"),
+                None => {
+                    eprintln!("{}", "Could not resolve lucia config path.".red());
+                    return;
+                }
+            }
+        }
+        "lym" | "fetch" => lym_dir.join("config.json"),
+        _ => unreachable!(),
+    };
+
+    if target == "fetch" {
+        let old_uuid = fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
+            .and_then(|json| json.get("build_info")?.get("uuid")?.as_str().map(|s| s.to_string()));
+    
+        fs::remove_file(&config_path).ok();
+        fs::write(&config_path, "{}").ok();
+    
+        match update_config_with_lucia_info(&config_path) {
+            Ok(_) => {
+                let new_uuid = fs::read_to_string(&config_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
+                    .and_then(|json| json.get("build_info")?.get("uuid")?.as_str().map(|s| s.to_string()));
+    
+                println!("{}", format!("Successfully fetched config at {}", config_path.display()).green());
+    
+                match (old_uuid, new_uuid) {
+                    (Some(old), Some(new)) if old != new => {
+                        println!(
+                            "{}",
+                            format!("Lucia UUID changed from '{}' to '{}'", old.bold(), new.bold()).blue()
+                        );
+                    }
+                    (Some(old), Some(new)) => {
+                        println!("{}", format!("Lucia UUID remained '{}'", old.bold()).blue());
+                    }
+                    _ => {
+                        println!("{}", "Could not compare build_info.uuid".dimmed());
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("{}", format!("Failed to update fetch config: {}", e).red());
+                return;
+            }
+        }
+        return;
+    }    
+
+    if let Some((key, value)) = set_pair {
+        let mut config_json: serde_json::Map<String, JsonValue> = if config_path.exists() {
+            match fs::read_to_string(&config_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+            {
+                Some(JsonValue::Object(map)) => map,
+                _ => {
+                    eprintln!("{}", "Failed to read or parse config file.".red());
+                    return;
+                }
+            }
+        } else {
+            serde_json::Map::new()
+        };
+
+        if config_json.contains_key(&key) && !no_confirm {
+            let confirm = Confirm::new()
+                .with_prompt(format!("Key '{}' exists, overwrite?", key))
+                .default(false)
+                .interact()
+                .unwrap_or(false);
+
+            if !confirm {
+                println!("{}", "Aborted.".yellow());
+                return;
+            }
+        }
+
+        config_json.insert(key, JsonValue::String(value));
+
+        let json_str = match serde_json::to_string_pretty(&config_json) {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("{}", "Failed to serialize config.".red());
+                return;
+            }
+        };
+
+        if let Err(e) = fs::write(&config_path, json_str) {
+            eprintln!("{}", format!("Failed to write config: {}", e).red());
+        } else {
+            println!("{}", format!("Config updated at {}", config_path.display()).green());
+        }
+
+    } else if let Some(key) = get_key {
+        let config_json: JsonValue = fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|data| serde_json::from_str(&data).ok())
+            .unwrap_or_else(|| json!({}));
+
+        match config_json.get(&key) {
+            Some(val) => println!("{}", val),
+            None => eprintln!("{}", format!("Key '{}' not found in config.", key).yellow()),
+        }
+    }
 }
 
 fn modify(args: &[String]) {
-    todo!();
+    if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
+        command_help("modify");
+        return;
+    }
+
+    let mut args = args.iter();
+    let name = match args.next() {
+        Some(n) => n,
+        None => {
+            eprintln!("{}", "Package name is required.".red());
+            command_help("modify");
+            return;
+        }
+    };
+
+    let mut stored = false;
+    let mut no_confirm = false;
+    let mut key_path = Vec::new();
+    let mut value_path = Vec::new();
+    let mut key_found = false;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--stored" => stored = true,
+            "--no-confirm" => no_confirm = true,
+            "--help" | "-h" => {
+                command_help("modify");
+                return;
+            }
+            _ => {
+                if !key_found {
+                    key_path.push(arg.clone());
+                    key_found = true;
+                } else {
+                    value_path.push(arg.clone());
+                }
+            }
+        }
+    }
+
+    if key_path.is_empty() {
+        eprintln!("{}", "Missing key.".red());
+        return;
+    }
+
+    let lym_dir = match get_lym_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{}", format!("Failed to get lym dir: {}", e).red());
+            return;
+        }
+    };
+
+    let package_path = if stored {
+        lym_dir.join("store").join(name)
+    } else {
+        let main_config_path = lym_dir.join("config.json");
+        let main_config_json: JsonValue = fs::read_to_string(&main_config_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| json!({}));
+    
+        match main_config_json
+            .get("lucia_path")
+            .and_then(JsonValue::as_str)
+            .map(PathBuf::from)
+            .and_then(|p| p.parent().and_then(|p| p.parent()).map(|env_root| env_root.join("libs").join(name)))
+        {
+            Some(path) => path,
+            None => {
+                eprintln!("{}", "Failed to locate lucia libs path.".red());
+                return;
+            }
+        }
+    };
+    
+    if !package_path.exists() {
+        eprintln!(
+            "{}",
+            format!("Package '{}' is not installed (no directory at {})", name, package_path.display()).red()
+        );
+        return;
+    }
+    
+    let manifest_path = package_path.join("manifest.json");
+    if !manifest_path.exists() {
+        eprintln!("{}", format!("No manifest found at {}", manifest_path.display()).red());
+        return;
+    }    
+
+    let manifest_path = package_path.join("manifest.json");
+    if !manifest_path.exists() {
+        eprintln!("{}", format!("No manifest found at {}", manifest_path.display()).red());
+        return;
+    }
+
+    let mut manifest_json: JsonValue = match fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+    {
+        Some(json) => json,
+        None => {
+            eprintln!("{}", "Failed to read or parse manifest.".red());
+            return;
+        }
+    };
+
+    let mut current = &mut manifest_json;
+    for (i, part) in key_path.iter().enumerate() {
+        if i == key_path.len() - 1 {
+            break;
+        }
+
+        current = current
+            .as_object_mut()
+            .and_then(|map| {
+                if !map.contains_key(part) {
+                    map.insert(part.clone(), json!({}));
+                }
+                map.get_mut(part)
+            })
+            .unwrap_or_else(|| {
+                eprintln!("{}", "Invalid path in manifest.".red());
+                std::process::exit(1);
+            });
+    }
+
+    let last_key = key_path.last().unwrap();
+
+    if value_path.is_empty() {
+        match current.get(last_key) {
+            Some(v) => println!("{}", v),
+            None => eprintln!("{}", format!("Key '{}' not found.", last_key).yellow()),
+        }
+    } else {
+        let new_value = if value_path.len() == 1 {
+            JsonValue::String(value_path[0].clone())
+        } else {
+            JsonValue::Array(value_path.into_iter().map(JsonValue::String).collect())
+        };
+
+        let exists = current.get(last_key).is_some();
+        if exists && !no_confirm {
+            let confirm = Confirm::new()
+                .with_prompt(format!("Key '{}' exists, overwrite?", last_key))
+                .default(false)
+                .interact()
+                .unwrap_or(false);
+
+            if !confirm {
+                println!("{}", "Aborted.".yellow());
+                return;
+            }
+        }
+
+        if let Some(map) = current.as_object_mut() {
+            map.insert(last_key.clone(), new_value);
+        } else {
+            eprintln!("{}", "Failed to write to manifest.".red());
+            return;
+        }
+
+        match serde_json::to_string_pretty(&manifest_json) {
+            Ok(json_str) => {
+                if let Err(e) = fs::write(&manifest_path, json_str) {
+                    eprintln!("{}", format!("Failed to write manifest: {}", e).red());
+                } else {
+                    println!("{}", format!("Manifest updated at {}", manifest_path.display()).green());
+                }
+            }
+            Err(_) => eprintln!("{}", "Failed to serialize updated manifest.".red()),
+        }
+    }
 }
 
 fn new(args: &[String]) {
-    todo!();
+    if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
+        command_help("new");
+        return;
+    }
+
+    let mut args = args.iter();
+    let kind = match args.next() {
+        Some(k) if k == "package" || k == "module" => k.as_str(),
+        _ => {
+            eprintln!("{}", "First argument must be 'package' or 'module'.".red());
+            command_help("new");
+            return;
+        }
+    };
+
+    let name = match args.next() {
+        Some(n) => n,
+        None => {
+            eprintln!("{}", "Missing name argument.".red());
+            command_help("new");
+            return;
+        }
+    };
+
+    let path = match args.next() {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            current_dir.join(name)
+        }
+    };
+
+    let mut no_confirm = false;
+    let mut main_file = String::from("__init__.lc");
+
+    for arg in args {
+        if arg == "--no-confirm" {
+            no_confirm = true;
+        } else if let Some(file) = arg.strip_prefix("--main-file:") {
+            main_file = file.to_string();
+        } else if arg == "--help" || arg == "-h" {
+            command_help("new");
+            return;
+        } else {
+            eprintln!("{}", format!("Unknown option '{}'", arg).yellow());
+            command_help("new");
+            return;
+        }
+    }
+
+    if path.exists() && !no_confirm {
+        let confirm = Confirm::new()
+            .with_prompt(format!("Path '{}' already exists. Overwrite?", path.display()))
+            .default(false)
+            .interact()
+            .unwrap_or(false);
+        if !confirm {
+            println!("{}", "Aborted.".yellow());
+            return;
+        }
+        fs::remove_dir_all(&path).ok();
+    }
+
+    if let Err(e) = fs::create_dir_all(&path) {
+        eprintln!("{}", format!("Failed to create path: {}", e).red());
+        return;
+    }
+
+    let lym_dir = match get_lym_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{}", format!("Failed to get lym dir: {}", e).red());
+            return;
+        }
+    };
+
+    match kind {
+        "package" => {
+            let manifest_path = path.join("manifest.json");
+            let main_config_path = lym_dir.join("config.json");
+            let main_config_json: JsonValue = fs::read_to_string(&main_config_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_else(|| json!({}));
+            
+            let required_version = main_config_json
+                .get("build_info")
+                .and_then(|bi| bi.get("version"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or("0.0.0")
+                .to_string();
+            
+            let manifest = json!({
+                "name": name,
+                "version": "0.1.0",
+                "description": "",
+                "required_lucia_version": format!("^{}", required_version),
+            });            
+
+            if let Err(e) = fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap()) {
+                eprintln!("{}", format!("Failed to write manifest: {}", e).red());
+                return;
+            }
+
+            if fs::write(path.join(&main_file), r#"print("Hello world")"#).is_err() {
+                eprintln!("{}", "Failed to create main file.".red());
+            }
+
+            println!("{}", format!("New package created at {}", path.display()).green());
+        }
+
+        "module" => {
+            let module_path = path.join(format!("{}.lc", name));
+            if let Err(e) = fs::create_dir_all(&path) {
+                eprintln!("{}", format!("Failed to create module directory: {}", e).red());
+                return;
+            }
+
+            if fs::write(&module_path, r#"print("Hello world")"#).is_err() {
+                eprintln!("{}", "Failed to create module file.".red());
+                return;
+            }
+
+            println!("{}", format!("New module '{}' created at {}", name, module_path.display()).green());
+        }
+
+        _ => unreachable!(),
+    }
 }
 
 fn main() {
