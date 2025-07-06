@@ -50,7 +50,7 @@ import sha256
 print(sha256.hash("Hello world!"))
 ```
 
-\***Note:** The package **sha256** doesnt exists *yet* - but if it was, it will work just fine!
+\***Note:** The package **sha256** doesnt exists *yet* - but if it did, it would work just fine
 
 ## Adding a Package
 
