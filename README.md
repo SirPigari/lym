@@ -33,6 +33,25 @@ Lym comes preinstalled with [Lucia](https://github.com/SirPigari/lucia-rust).
 - **new** `[package | module] [name] [path] [--no-confirm] [--help] [--main-file:<name>]`  
   Creates a new package or module at the given path.
 
+## Example
+Let's say you want to install the **sha256** package.  
+First you do:
+
+```bash
+lym install sha256
+```
+
+And thats all!  
+Now you can create a new lucia script and use it freely like this:
+
+```lucia
+import sha256
+
+print(sha256.hash("Hello world!"))
+```
+
+\***Note:** The package **sha256** doesnt exists *yet* - but if it was, it will work just fine!
+
 ## Adding a Package
 
 1. Create your package, making sure it includes a valid [manifest.json](#manifest) file in the root directory.  
