@@ -144,4 +144,4 @@ Following these helps keep the package ecosystem healthy, compatible, and easier
 **Lym** is licensed under the [GNU General Public License v3.0 (GPLv3)](LICENSE).
 The same for [Lucia Programming Language](https://github.com/SirPigari/lucia-rust).
 
-Each package submitted to Lym can specify its own license using the optional `"license"` field in the manifest.json file.
+Each package submitted to Lym can specify its own license using the optional `"license"` field in the manifest.json file. If no license is specified, GPLv3 applies by default.  
