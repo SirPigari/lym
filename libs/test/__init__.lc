@@ -1,1 +1,1 @@
-throw "TEST PACKAGE" from "LymError"
+print("Hello world!")
