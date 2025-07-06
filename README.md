@@ -1,0 +1,73 @@
+# Lym
+
+**Lym** is a package/module manager for [Lucia Programming Language](https://github.com/SirPigari/lucia-rust) made in [Rust](https://rust-lang.org)
+
+## Commands
+
+`lym`  
+- `install [package_name] [--no-confirm] [-v] [--help]`  
+  Installs the package you want, with options to skip confirmation, get more details, or see help.
+
+- `list [--remote | --local | --store] [--no-desc] [--no-ver] [--no-std] [--help]`  
+  Shows you packages that are installed locally, remotely, or in the store. You can hide descriptions, versions, or standard packages if you want.
+
+- `download [package_name] [output_path] [--no-confirm] [-v] [--help]`  
+  Downloads a package to a folder you choose, with options to skip confirmation and see more info.
+
+- `remove [package_name] [--no-confirm] [-v] [--help]`  
+  Deletes a package from your system. You can skip confirmation or get detailed output if needed.
+
+- `disable [package_name] [--no-confirm] [-v] [--help]`  
+  Temporarily turns off a package without deleting it, with options for confirmation and verbose output.
+
+- `enable [package_name] [--no-confirm] [-v] [--help]`  
+  Turns a disabled package back on, also with optional confirmation and detailed output.
+
+- `config [ lym | lucia | fetch ] [--set <key=value>] [--get <key>] [--help] [--no-confirm]`  
+  Lets you view or change settings for Lym, Lucia, or refetch the Lym config (fetch just fetches doesnt do anything with the argv).
+
+- `modify [package_name] [--stored] <key> [value1 [value2 ...]] [--no-confirm] [--help]`  
+  Changes info in a package's manifest or stored data by updating keys and values.
+
+- `new [package | module] [name] [path] [--no-confirm] [--help] [--main-file:<name>]`  
+  Creates a new package or module with your chosen name and location, and you can set the main file if you want.
+
+## Adding a Package
+
+1. Create your package, making sure it includes a valid [manifest.json](#manifest) file in the root directory.  
+2. Submit a pull request with your package to the repository for review.  
+3. Once approved, your package will be added and available for everyone.
+
+
+## Manifest
+
+Manifest is a manifest.json file in the root directory of the package.
+
+it should have:
+```json
+{
+    "name": "package",
+    "version": "0.1.0",
+    "required_lucia_version": "^2.0.0",
+    "description": "description",
+    "license": "MIT", // optional license field
+    "authors": [
+        // list of authors (optional)
+    ],
+    "config": {
+        // keys that must be enabled in the lucia config for this package to work
+    },
+    "dependencies" {
+        // deps needed, eg.: "package2": "^3.69.42"
+    }
+}
+```
+
+Authors, config, license and dependencies are optional.
+
+## LICENSE
+
+**Lym** is licensed under the [GNU General Public License v3.0 (GPLv3)](LICENSE).
+The same for [Lucia Programming Language](https://github.com/SirPigari/lucia-rust).
+
+Each package submitted to Lym can specify its own license using the optional `"license"` field in the manifest.json file.
