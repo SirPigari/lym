@@ -1282,8 +1282,9 @@ fn remove(args: &[String]) {
         let local_pkg_path = libs_dir.join(&pkg_name);
 
         if !local_pkg_path.exists() {
+            println!("Package '{}' is not installed, skipping.", pkg_name.bright_cyan());
             if verbose {
-                println!("Package '{}' is not installed, skipping.", pkg_name.bright_cyan());
+                println!("{} {}", "Package not found at:".yellow(), local_pkg_path.display());
             }
             continue;
         }
