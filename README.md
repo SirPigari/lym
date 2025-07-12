@@ -129,9 +129,6 @@ it should have:
 - **Specify the minimum required Lucia version precisely using semantic versioning.**  
   This helps ensure your package is used only in compatible environments.
 
-- **Use meaningful and concise descriptions.**  
-  This makes your package easier to discover and understand by others.
-
 - **Test your package before submitting.**  
   Make sure all declared dependencies and config keys work as expected to avoid issues for users.
 
@@ -140,7 +137,7 @@ it should have:
 
 ---
 
-Following these helps keep the package ecosystem healthy, compatible, and easier to maintain! uwu
+Following these helps keep the package ecosystem healthy, compatible, and easier to maintain!
 
 ## LICENSE
 
