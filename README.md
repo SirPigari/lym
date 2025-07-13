@@ -1,7 +1,7 @@
 # Lym
 
 **Lym** is a package/module manager for [Lucia Programming Language](https://github.com/SirPigari/lucia-rust) made in [Rust](https://rust-lang.org)  
-Lym comes preinstalled with [Lucia](https://github.com/SirPigari/lucia-rust).  
+Lym comes preinstalled with Lucia.  
 
 Not to confuse *lym* with <a href="https://en.wikipedia.org/wiki/Lymphoma" style="color:inherit; text-decoration:none;" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">*lymphoma*</a>
 
