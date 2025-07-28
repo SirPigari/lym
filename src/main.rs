@@ -1344,7 +1344,7 @@ fn config(args: &[String]) {
 
     let target = args[0].as_str();
     if target != "lym" && target != "lucia" && target != "fetch" {
-        eprintln!("{}", "First argument must be 'lym' or 'lucia'.".red());
+        eprintln!("{}", "First argument must be 'lym', 'lucia', or 'fetch'.".red());
         command_help("config");
         return;
     }
