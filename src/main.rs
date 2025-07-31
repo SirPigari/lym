@@ -14,7 +14,7 @@ use base64::{engine::general_purpose, Engine as _};
 mod db;
 mod utils;
 
-use db::STD_LIBS;
+use db::{STD_LIBS, load_std_libs};
 use utils::check_version;
 
 // lym - Lucia package manager
@@ -1854,6 +1854,33 @@ fn main() {
 
     let lym_dir = get_lym_dir().expect("Failed to get lym dir");
     let config_path = lym_dir.join("config.json");
+
+    let main_config_json: JsonValue = fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|data| serde_json::from_str(&data).ok())
+        .unwrap_or_else(|| json!({}));
+
+    let lucia_path_str = match main_config_json.get("lucia_path").and_then(JsonValue::as_str) {
+        Some(p) => p,
+        None => {
+            eprintln!("{}", "Failed to get lucia path from main config.".red());
+            return;
+        }
+    };
+
+    let lucia_path = Path::new(lucia_path_str);
+    let libs_path = match lucia_path.parent().and_then(|p| p.parent()) {
+        Some(parent) => parent.join("libs.json"),
+        None => {
+            eprintln!("{}", "Could not resolve lucia config path.".red());
+            return;
+        }
+    };
+
+    if let Err(err) = load_std_libs(&libs_path) {
+        eprintln!("{}", format!("Failed to load standard libraries: {}", err).red());
+        exit(1);
+    }
 
     let should_update = match fs::read_to_string(&config_path) {
         Ok(data) => {

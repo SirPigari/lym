@@ -1,94 +1,62 @@
 use std::collections::HashMap;
 use once_cell::sync::Lazy;
+use serde::Deserialize;
+use std::fs;
+use std::path::Path;
+use std::sync::RwLock;
 
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct LibInfo {
-    pub description: &'static str,
-    pub version: &'static str,
-    pub expected_lucia_version: &'static str,
+    pub description: String,
+    pub version: String,
+    pub expected_lucia_version: String,
 }
 
-pub static STD_LIBS: Lazy<HashMap<&'static str, LibInfo>> = Lazy::new(|| {
-    let mut m = HashMap::new();
+pub struct LibRegistry {
+    inner: RwLock<HashMap<String, LibInfo>>,
+}
 
-    m.insert("math", LibInfo {
-        description: "Provides mathematical functions and constants.",
-        version: "1.0.0",
-        expected_lucia_version: "^2.0.0",
-    });
+impl LibRegistry {
+    pub fn new() -> Self {
+        LibRegistry {
+            inner: RwLock::new(HashMap::new()),
+        }
+    }
 
-    m.insert("os", LibInfo {
-        description: "Interfaces with the operating system.",
-        version: "1.0.0",
-        expected_lucia_version: "^2.0.0",
-    });
+    pub fn get(&self, name: &str) -> Option<LibInfo> {
+        self.inner.read().ok()?.get(name).cloned()
+    }
 
-    m.insert("time", LibInfo {
-        description: "Handles time and date functionality.",
-        version: "0.3.0",
-        expected_lucia_version: "^2.0.0",
-    });
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.inner.read().ok().expect("Failed to acquire read lock").contains_key(name)
+    }
 
-    m.insert("json", LibInfo {
-        description: "JSON parsing and serialization.",
-        version: "1.0.82",
-        expected_lucia_version: "^2.0.0",
-    });
+    pub fn set_all(&self, new_libs: HashMap<String, LibInfo>) {
+        if let Ok(mut inner) = self.inner.write() {
+            *inner = new_libs;
+        }
+    }
+}
 
-    m.insert("config", LibInfo {
-        description: "Lucia configuration management.",
-        version: "0.2.6",
-        expected_lucia_version: "^2.0.0",
-    });
+pub fn load_std_libs(path: &Path) -> Result<(), String> {
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read libs file: {}", e))?;
 
-    m.insert("regex", LibInfo {
-        description: "Regular expressions for pattern matching.",
-        version: "0.9.0",
-        expected_lucia_version: "^2.0.0",
-    });
+    let json: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse JSON: {}", e))?;
 
-    m.insert("collections", LibInfo {
-        description: "Collection of utilities.",
-        version: "1.0.0",
-        expected_lucia_version: "^2.0.0",
-    });
-    
-    m.insert("random", LibInfo {
-        description: "Random number generation utilities.",
-        version: "0.7.42",
-        expected_lucia_version: "^2.0.0",
-    });
+    let std_libs = json.get("std_libs")
+        .ok_or("Missing 'std_libs' field in JSON".to_string())?;
 
-    m.insert("fs", LibInfo {
-        description: "File system operations and utilities.",
-        version: "0.4.0",
-        expected_lucia_version: "^2.0.0",
-    });
+    let parsed: HashMap<String, LibInfo> = serde_json::from_value(std_libs.clone())
+        .map_err(|e| format!("Failed to parse 'std_libs': {}", e))?;
 
-    m.insert("clib", LibInfo {
-        description: "C standard library bindings for Lucia using TCC.",
-        version: "0.1.69",
-        expected_lucia_version: "^2.0.0",
-    });
+    STD_LIBS.set_all(parsed.clone());
 
-    m.insert("lasm", LibInfo {
-        description: "Cross-platform, lightweight assembly-inspired utilities for low-level programming and direct hardware control.",
-        version: "1.0.3",
-        expected_lucia_version: "^2.0.0",
-    });
-    
-    m.insert("nest", LibInfo {
-        description: "HTTP client and server utilities.",
-        version: "1.1.0",
-        expected_lucia_version: "^2.0.0",
-    });
+    Ok(())
+}
 
-    m.insert("libload", LibInfo {
-        description: "Dynamic library loading and function invocation.",
-        version: "1.0.0",
-        expected_lucia_version: "^2.0.0",
-    });
-
-    m
+pub static STD_LIBS: Lazy<LibRegistry> = Lazy::new(|| {
+    LibRegistry::new()
 });
