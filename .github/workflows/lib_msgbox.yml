@@ -1,0 +1,74 @@
+name: Build shared libs
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    outputs:
+      artifact_name: zip-artifact
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set output file name
+        id: libname
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            echo "ext=dll" >> $GITHUB_OUTPUT
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            echo "ext=dylib" >> $GITHUB_OUTPUT
+          else
+            echo "ext=so" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
+      - name: Build shared lib
+        run: |
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            gcc -shared -fPIC -o msgbox.so libs/msgbox/msgbox.c
+          elif [ "$RUNNER_OS" == "macOS" ]; then
+            clang -dynamiclib -o msgbox.dylib libs/msgbox/msgbox.c
+          elif [ "$RUNNER_OS" == "Windows" ]; then
+            cl.exe /LD libs\\msgbox\\msgbox.c /Fe:msgbox.dll
+          fi
+        shell: bash
+
+      - name: Upload built lib
+        uses: actions/upload-artifact@v4
+        with:
+          name: msgbox-${{ steps.libname.outputs.ext }}
+          path: msgbox.${{ steps.libname.outputs.ext }}
+
+  bundle:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Reorganize into zip/ folder
+        run: |
+          mkdir -p zip
+          cp artifacts/msgbox-dll/msgbox.dll zip/ || true
+          cp artifacts/msgbox-so/msgbox.so zip/ || true
+          cp artifacts/msgbox-dylib/msgbox.dylib zip/ || true
+
+      - name: Create zip file
+        run: zip -j shared-libs.zip zip/*
+
+      - name: Upload zip bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-libs
+          path: shared-libs.zip

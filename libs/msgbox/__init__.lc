@@ -73,20 +73,20 @@ public final MSGBOX_TYPEMASK: int           = 0x000F
 public final MSGBOX_ICONMASK: int           = 0x00F0
 
 // Return constants aligned with Windows IDOK
-public final MSGBOX_RET_OK: int         = 1
-public final MSGBOX_RET_CANCEL: int     = 2
-public final MSGBOX_RET_ABORT: int      = 3
-public final MSGBOX_RET_RETRY: int      = 4
-public final MSGBOX_RET_IGNORE: int     = 5
-public final MSGBOX_RET_YES: int        = 6
-public final MSGBOX_RET_NO: int         = 7
-public final MSGBOX_RET_CLOSE: int      = 8
-public final MSGBOX_RET_HELP: int       = 9
-public final MSGBOX_RET_TRYAGAIN: int   = 10
-public final MSGBOX_RET_CONTINUE: int   = 11
+public final MSGBOX_RET_OK: int             = 1
+public final MSGBOX_RET_CANCEL: int         = 2
+public final MSGBOX_RET_ABORT: int          = 3
+public final MSGBOX_RET_RETRY: int          = 4
+public final MSGBOX_RET_IGNORE: int         = 5
+public final MSGBOX_RET_YES: int            = 6
+public final MSGBOX_RET_NO: int             = 7
+public final MSGBOX_RET_CLOSE: int          = 8
+public final MSGBOX_RET_HELP: int           = 9
+public final MSGBOX_RET_TRYAGAIN: int       = 10
+public final MSGBOX_RET_CONTINUE: int       = 11
 
 private final show_message_box_c: &int = libload.get_fn(lib, "show_message_box", [
-    "any", "any", "int"
+    "str", "str", "int"
 ], "int")
 
 public final fun show_message_box(
@@ -110,8 +110,7 @@ public final fun show_message_box(
     if (_title == null || _message == null):
         throw "Invalid pointer: null" from "PointerError"
     end
-    ret := libload.call_fn(show_message_box_c, [_title, _message, flags])
-    return ret
+    return libload.call_fn(show_message_box_c, [_title, _message, flags])
 end
 
 public final fun msgbox_err(title: str, message: str) -> int:

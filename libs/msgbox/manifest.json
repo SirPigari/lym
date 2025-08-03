@@ -8,6 +8,10 @@
     ],
     "dependencies": {
         "os": "^1.0.0",
-        "libload": "^1.0.0"
+        "libload": "^1.0.0",
+        "fs": "^0.4.0"
+    },
+    "config": {
+        "allow_unsafe": true
     }
 }
