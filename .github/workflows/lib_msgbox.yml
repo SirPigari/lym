@@ -36,10 +36,16 @@ jobs:
             gcc -shared -fPIC -o msgbox.so libs/msgbox/msgbox.c
           elif [ "$RUNNER_OS" == "macOS" ]; then
             clang -dynamiclib -o msgbox.dylib libs/msgbox/msgbox.c
-          elif [ "$RUNNER_OS" == "Windows" ]; then
-            cl.exe /LD libs\\msgbox\\msgbox.c /Fe:msgbox.dll
           fi
+        if: runner.os != 'Windows'
         shell: bash
+
+      - name: Build shared lib (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cl.exe /LD libs\msgbox\msgbox.c /Fe:msgbox.dll
 
       - name: Upload built lib
         uses: actions/upload-artifact@v4
