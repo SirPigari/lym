@@ -8,26 +8,27 @@ import fs
 private mutable lib: any = null
 
 fs.change_dir(__dir__)
-if (!fs.file_exists("msgbox.dll")):
-    throw "msgbox.dll not found in the current directory." from "FileNotFoundError"
-end if (!fs.file_exists("msgbox.so")):
-    throw "msgbox.so not found in the current directory." from "FileNotFoundError"
-end if (!fs.file_exists("msgbox.dylib")):
-    throw "msgbox.dylib not found in the current directory." from "FileNotFoundError"
-end
-
 match (os.os_name()):
     "Windows":
+        if (!fs.file_exists("msgbox.dll")):
+            throw "msgbox.dll not found in the current directory." from "FileNotFoundError"
+        end
         lib = libload.load_lib("msgbox.dll")
     end
     "Linux":
+        if (!fs.file_exists("msgbox.so")):
+            throw "msgbox.so not found in the current directory." from "FileNotFoundError"
+        end
         lib = libload.load_lib("msgbox.so")
     end
     "Darwin":
+        if (!fs.file_exists("msgbox.dylib")):
+            throw "msgbox.dylib not found in the current directory." from "FileNotFoundError"
+        end
         lib = libload.load_lib("msgbox.dylib")
     end
     _:
-        throw f"Unsupported OS: {os.os_name}" from "UnsupportedOSError"
+        throw f"Unsupported OS: {os.os_name()}" from "UnsupportedOSError"
     end
 end
 
