@@ -70,7 +70,7 @@
 EXPORT int show_message_box(const char *title, const char *message, int style_flags)
 {
 #ifdef _WIN32
-    UINT type = 0;
+    UINT type = MB_SETFOREGROUND;
 
     switch (style_flags & MSGBOX_TYPEMASK)
     {
