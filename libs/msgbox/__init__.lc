@@ -1,10 +1,20 @@
 import libload
 import os
+import fs
 
 // Simple message box library for displaying message boxes with various styles and icons.
 // This library supports Windows, Linux, and macOS platforms.
 
 private mutable lib: any = null
+
+fs.change_dir(__dir__)
+if (!fs.file_exists("msgbox.dll")):
+    throw "msgbox.dll not found in the current directory." from "FileNotFoundError"
+end if (!fs.file_exists("msgbox.so")):
+    throw "msgbox.so not found in the current directory." from "FileNotFoundError"
+end if (!fs.file_exists("msgbox.dylib")):
+    throw "msgbox.dylib not found in the current directory." from "FileNotFoundError"
+end
 
 match (os.os_name()):
     "Windows":
