@@ -18,7 +18,7 @@ jobs:
         clang -dynamiclib -o msgbox.dylib libs/msgbox/msgbox.c
 
     - name: Upload dylib artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: msgbox-dylib
         path: msgbox.dylib
