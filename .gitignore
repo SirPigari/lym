@@ -1,4 +1,5 @@
 /target
-lym.exe
+/lym.exe
 Cargo.lock
 .vscode/
+/bin/

@@ -1834,7 +1834,7 @@ fn new(args: &[String]) {
                 return;
             }
 
-            if fs::write(&module_path, r#"print("Hello world")"#).is_err() {
+            if fs::write(&module_path, "fun main() -> void:\n    print(\"Hello world\")\nend\n\nmain()\n".as_bytes()).is_err() {
                 eprintln!("{}", "Failed to create module file.".red());
                 return;
             }

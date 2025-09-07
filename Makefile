@@ -5,11 +5,14 @@ LYM_DIR := .
 TARGET_DIR := $(LYM_DIR)
 TARGET_EXE := lym$(if $(IS_WINDOWS_CMD),.exe,)
 TARGET := $(TARGET_DIR)/$(TARGET_EXE)
+TARGET_BIN := $(TARGET_DIR)/bin/$(TARGET_EXE)
+TARGET_TMP := $(TARGET_EXE).tmp
 
 ifeq ($(IS_WINDOWS_CMD),cmd.exe)
 	CARGO := cargo
 	MKDIR := if not exist "$(subst /,\,$(TARGET_DIR))" mkdir "$(subst /,\,$(TARGET_DIR))"
 	MOVE := move /Y
+	COPY := copy /Y
 	RUN_FULL := $(subst /,\,$(TARGET_DIR))\$(TARGET_EXE)
 	SHELL := cmd
 	.SHELLFLAGS := /C
@@ -17,6 +20,7 @@ else
 	CARGO := cargo
 	MKDIR := mkdir -p $(TARGET_DIR)
 	MOVE := mv -f
+	COPY := cp -f
 	RUN_FULL := $(TARGET_DIR)/$(TARGET_EXE)
 endif
 
@@ -28,9 +32,13 @@ $(TARGET):
 	@$(CARGO) build --bin lym
 	@$(MKDIR)
 ifeq ($(IS_WINDOWS_CMD),cmd.exe)
-	@$(MOVE) "$(LYM_DIR)\target\debug\$(TARGET_EXE)" "$(subst /,\\,$(TARGET))"
+	@$(MOVE) "$(LYM_DIR)\target\debug\$(TARGET_EXE)" "$(subst /,\\,$(TARGET_BIN))"
+	@$(COPY) "$(subst /,\\,$(TARGET_BIN))" "$(subst /,\\,$(TARGET_TMP))"
+	@$(MOVE) "$(subst /,\\,$(TARGET_TMP))" "$(subst /,\\,$(TARGET))"
 else
-	@$(MOVE) "$(LYM_DIR)/target/debug/$(TARGET_EXE)" "$(TARGET)"
+	@$(MOVE) "$(LYM_DIR)/target/debug/$(TARGET_EXE)" "$(TARGET_BIN)"
+	@$(COPY) "$(TARGET_BIN)" "$(TARGET_TMP)"
+	@$(MOVE) "$(TARGET_TMP)" "$(TARGET)"
 endif
 
 build: $(TARGET)

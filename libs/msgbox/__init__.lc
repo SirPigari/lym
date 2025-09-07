@@ -5,7 +5,7 @@ import fs
 // Simple message box library for displaying message boxes with various styles and icons.
 // This library supports Windows, Linux, and macOS platforms.
 
-private mutable lib: any = null
+private mutable lib: ?&int = null
 
 fs.change_dir(__dir__)
 match (os.os_name()):
@@ -27,7 +27,7 @@ match (os.os_name()):
         end
         lib = libload.load_lib("msgbox.dylib")
     end
-    _:
+    _ ->
         throw f"Unsupported OS: {os.os_name()}" from "UnsupportedOSError"
     end
 end
