@@ -1,5 +1,9 @@
 // sounds.c - Native sound playback implementation for Lucia
-// Cross-platform stub (Windows/Linux/macOS)
+#if defined(__linux__) || defined(__APPLE__)
+#include <unistd.h>
+#include <signal.h>
+#include <sys/types.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
