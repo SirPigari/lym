@@ -7,6 +7,12 @@
 #include <string.h>
 
 #ifdef _WIN32
+#define SOUNDS_EXPORT __declspec(dllexport)
+#else
+#define SOUNDS_EXPORT __attribute__((visibility("default")))
+#endif
+
+#ifdef _WIN32
 #include <windows.h>
 #include <mmsystem.h>
 #pragma comment(lib, "winmm.lib")
@@ -59,8 +65,7 @@ struct SoundId
 #define MAX_SOUNDS 64
 static struct SoundId sound_registry[MAX_SOUNDS];
 static int next_id = 1;
-
-__declspec(dllexport) int play_sound(const char *path, float duration_ms, bool loop, float volume, bool sync, bool debug)
+SOUNDS_EXPORT int play_sound(const char *path, float duration_ms, bool loop, float volume, bool sync, bool debug)
 {
     int id = next_id++;
     if (id >= MAX_SOUNDS)
@@ -196,7 +201,7 @@ __declspec(dllexport) int play_sound(const char *path, float duration_ms, bool l
     return id;
 }
 
-__declspec(dllexport) void stop_sound(int id)
+SOUNDS_EXPORT void stop_sound(int id)
 {
     if (id <= 0 || id >= MAX_SOUNDS)
         return;
@@ -214,7 +219,7 @@ __declspec(dllexport) void stop_sound(int id)
     s->playing = false;
 }
 
-__declspec(dllexport) struct SoundId *get_playing_sounds(int *count)
+SOUNDS_EXPORT struct SoundId *get_playing_sounds(int *count)
 {
     static struct SoundId results[MAX_SOUNDS];
     int n = 0;
