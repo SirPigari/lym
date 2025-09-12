@@ -1,0 +1,151 @@
+import libload
+import os
+import fs
+
+// Lucia Sounds Library
+// Cross-platform sound playback and management
+
+#ifndef SOUNDS_DEBUG
+#define SOUNDS_DEBUG false
+#endif
+
+private mutable lib: any = null
+
+fs.change_dir(__dir__)
+match (os.os_name()):
+    "Windows":
+        if (!fs.file_exists("sounds.dll")):
+            throw "sounds.dll not found in the current directory." from "FileNotFoundError"
+        end
+        lib = libload.load_lib("sounds.dll")
+    end
+    "Linux":
+        if (!fs.file_exists("sounds.so")):
+            throw "sounds.so not found in the current directory." from "FileNotFoundError"
+        end
+        lib = libload.load_lib("sounds.so")
+    end
+    "Darwin":
+        if (!fs.file_exists("sounds.dylib")):
+            throw "sounds.dylib not found in the current directory." from "FileNotFoundError"
+        end
+        lib = libload.load_lib("sounds.dylib")
+    end
+    _ ->
+        throw f"Unsupported OS: {os.os_name()}" from "UnsupportedOSError"
+    end
+end
+
+// SoundId struct for tracking sound metadata
+public final typedef struct SoundId {
+    id: int,
+    path: str,
+    duration_ms: float,
+    loop: bool,
+    playing: bool,
+}
+
+public final typedef Volume[f] = float where (f >= 0.0 and f <= 1.0)
+
+private mutable _playing_sounds: map[int, SoundId] = {}
+private mutable _next_id: int = 1
+
+private final play_sound_c: &int = libload.get_fn(lib, "play_sound", ["str", "float", "bool", "float", "bool", "bool"], "int")
+private final stop_sound_c: &int = libload.get_fn(lib, "stop_sound", ["int"], "void")
+private final get_playing_sounds_c: &int = libload.get_fn(lib, "get_playing_sounds", [], "ptr")
+
+
+public final fun play_sound(path: str, duration_ms: float = 0.0, loop: bool = false, volume: Volume = 1.0, sync: bool = true) -> SoundId:
+    // Plays a sound file with the specified path, duration, loop option, volume, and sync mode.
+    //
+    // Parameters:
+    //     path (str): The path to the sound file.
+    //     duration_ms (?float): Duration in milliseconds to play (optional).
+    //     loop (bool): Whether to loop the sound.
+    //     volume (Volume): Playback volume (0.0 to 1.0).
+    //     sync (bool): If true, blocks until sound finishes. If false, returns immediately.
+    //
+    // NOTE: The sound may be delayed slightly if you dont use wav format. The function will convert mp3, flac, aac, ogg, m4a files to wav internally. which slows down the process.
+    // WARNING: If sync is false, you must manually wait (e.g. with time.sleep) until the sound finishes, otherwise playback may be cut off when your code ends.
+    //
+    // Returns:
+    //     SoundId: The struct containing sound info and id.
+    if (play_sound_c == null):
+        throw "Function 'play_sound' not found in the loaded library." from "FunctionNotFoundError"
+    end
+    if !fs.file_exists(path):
+        throw f"Sound file not found: {path}" from "FileNotFoundError"
+    end
+    if sync && duration_ms != 0.0:
+        throw "Duration does not work with sync mode. Use async mode instead." from "ValueError"
+    end
+    play_path := path
+    if fs.extension(path) in ["mp3", "flac", "aac", "ogg", "m4a"]:
+        tmp_dir := "./tmp/"
+        if (!fs.dir_exists(tmp_dir)):
+            fs.make_dir(tmp_dir)
+        end
+        out_path := tmp_dir + "/" + fs.basename(path) + ".wav"
+        fs.convert_audio_file(path, out_path)
+        play_path := out_path
+    else if !fs.extension(path) in ["wav"]:
+        throw f"Unsupported audio format: {fs.extension(path)}" from "UnsupportedFormatError"
+    end
+    path_cstr := libload.create_str_ptr(fs.fix_path(play_path))
+    id := libload.call_fn(play_sound_c, [path_cstr, duration_ms, loop, volume, sync, SOUNDS_DEBUG])
+    if (id < 0):
+        throw f"Failed to play sound: {path}" from "PlaySoundError"
+    end
+    sound := SoundId { id, path, duration_ms, loop, playing = true }
+    _playing_sounds[id] = sound
+    return sound
+end
+
+public final fun stop_sound(sound: SoundId):
+    // Stops a playing sound with the specified SoundId.
+    //
+    // Parameters:
+    //     sound (SoundId): The sound to stop.
+    //
+    // Returns:
+    //     void
+    if (stop_sound_c == null):
+        throw "Function 'stop_sound' not found in the loaded library." from "FunctionNotFoundError"
+    end
+    if (sound.id in _playing_sounds):
+        libload.call_fn(stop_sound_c, [sound.id])
+        _playing_sounds[sound.id].playing = false
+        remove _playing_sounds[sound.id]
+    end
+end
+
+public final fun get_playing_sounds() -> list[SoundId]:
+    // Returns a list of currently playing sounds.
+    //
+    // Parameters:
+    //     None
+    //
+    // Returns:
+    //     list[SoundId]: List of SoundId structs for all playing sounds.
+    if (get_playing_sounds_c == null):
+        throw "Function 'get_playing_sounds' not found in the loaded library." from "FunctionNotFoundError"
+    end
+    throw "get_playing_sounds not implemented yet" from "NotImplemented"
+end
+
+public final fun clear_temps():
+    // Clears temporary converted audio files.
+    // NOTE: Don't forget to call this function after you're done playing sounds to avoid cluttering up the tmp directory.
+    //
+    // Parameters:
+    //     None
+    //
+    // Returns:
+    //     void
+    tmp_dir := "./tmp/"
+    if (fs.dir_exists(tmp_dir)):
+        fs.remove_dir(tmp_dir, true)
+    end
+end
+
+// play_sound("miku.mp3")

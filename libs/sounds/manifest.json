@@ -1,0 +1,17 @@
+{
+    "name": "sounds",
+    "version": "1.0.0",
+    "required_lucia_version": "^2.0.0",
+    "description": "Lucia package for sound playback and management.",
+    "authors": [
+        "Markofwitch"
+    ],
+    "dependencies": {
+        "os": "^1.0.0",
+        "libload": "^1.0.0",
+        "fs": "^0.4.0"
+    },
+    "config": {
+        "allow_unsafe": true
+    }
+}

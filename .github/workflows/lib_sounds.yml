@@ -1,4 +1,4 @@
-name: msgbox - Build shared libs
+name: sounds - Build shared libs
 
 on:
   push:
@@ -33,9 +33,9 @@ jobs:
       - name: Build shared lib
         run: |
           if [ "$RUNNER_OS" == "Linux" ]; then
-            gcc -shared -fPIC -o msgbox.so libs/msgbox/msgbox.c
+            gcc -shared -fPIC -o sounds.so libs/sounds/sounds.c
           elif [ "$RUNNER_OS" == "macOS" ]; then
-            clang -dynamiclib -o msgbox.dylib libs/msgbox/msgbox.c
+            clang -dynamiclib -o sounds.dylib libs/sounds/sounds.c
           fi
         if: runner.os != 'Windows'
         shell: bash
@@ -45,13 +45,13 @@ jobs:
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          cl.exe /LD libs\msgbox\msgbox.c /link User32.lib /OUT:msgbox.dll
+          cl.exe /LD libs\sounds\sounds.c /link User32.lib /OUT:sounds.dll
 
       - name: Upload built lib
         uses: actions/upload-artifact@v4
         with:
-          name: msgbox-${{ steps.libname.outputs.ext }}
-          path: msgbox.${{ steps.libname.outputs.ext }}
+          name: sounds-${{ steps.libname.outputs.ext }}
+          path: sounds.${{ steps.libname.outputs.ext }}
 
   bundle:
     needs: build
@@ -66,9 +66,9 @@ jobs:
       - name: Reorganize into zip/ folder
         run: |
           mkdir -p zip
-          cp artifacts/msgbox-dll/msgbox.dll zip/ || true
-          cp artifacts/msgbox-so/msgbox.so zip/ || true
-          cp artifacts/msgbox-dylib/msgbox.dylib zip/ || true
+          cp artifacts/sounds-dll/sounds.dll zip/ || true
+          cp artifacts/sounds-so/sounds.so zip/ || true
+          cp artifacts/sounds-dylib/sounds.dylib zip/ || true
 
       - name: Create zip file
         run: zip -j shared-libs.zip zip/*

@@ -3,3 +3,6 @@
 Cargo.lock
 .vscode/
 /bin/
+
+# Sounds
+libs/sounds/tmp/
