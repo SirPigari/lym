@@ -4,5 +4,5 @@ Cargo.lock
 .vscode/
 /bin/
 
-# Sounds
-libs/sounds/tmp/
+# lumina - in development
+libs/lumina/

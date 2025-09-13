@@ -96,7 +96,7 @@ public final fun play_sound(path: str, duration_ms: float = 0.0, loop: bool = fa
     if (id < 0):
         throw f"Failed to play sound: {path}" from "PlaySoundError"
     end
-    sound := SoundId { id, path, duration_ms, loop, playing = true }
+    sound := SoundId { id, path, duration_ms, loop, playing = !sync }
     _playing_sounds[id] = sound
     return sound
 end

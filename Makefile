@@ -1,37 +1,41 @@
-IS_WINDOWS := $(shell echo $(ComSpec))
-IS_WINDOWS_CMD := $(findstring cmd.exe,$(IS_WINDOWS))
+IS_WINDOWS := $(findstring cmd.exe,$(ComSpec))
 
-LYM_DIR := .
-TARGET_DIR := $(LYM_DIR)
-TARGET_EXE := lym$(if $(IS_WINDOWS_CMD),.exe,)
+TARGET_DIR := .
+TARGET_BIN_DIR := $(TARGET_DIR)/bin
+TARGET_EXE := lym$(if $(IS_WINDOWS),.exe)
 TARGET := $(TARGET_DIR)/$(TARGET_EXE)
-TARGET_BIN := $(TARGET_DIR)/bin/$(TARGET_EXE)
+TARGET_BIN := $(TARGET_BIN_DIR)/$(TARGET_EXE)
 TARGET_TMP := $(TARGET_EXE).tmp
 
-ifeq ($(IS_WINDOWS_CMD),cmd.exe)
-	CARGO := cargo
-	MKDIR := if not exist "$(subst /,\,$(TARGET_DIR))" mkdir "$(subst /,\,$(TARGET_DIR))"
-	MOVE := move /Y
-	COPY := copy /Y
-	RUN_FULL := $(subst /,\,$(TARGET_DIR))\$(TARGET_EXE)
-	SHELL := cmd
-	.SHELLFLAGS := /C
+CARGO := cargo
+
+ifeq ($(IS_WINDOWS),cmd.exe)
+    MKDIR := if not exist "$(subst /,\,$(TARGET_DIR))" mkdir "$(subst /,\,$(TARGET_DIR))"
+    MKDIR_BIN := if not exist "$(subst /,\,$(TARGET_BIN_DIR))" mkdir "$(subst /,\,$(TARGET_BIN_DIR))"
+    MOVE := move /Y
+    COPY := copy /Y
+    RUN_FULL := $(subst /,\,$(TARGET))
+    SHELL := cmd
+    .SHELLFLAGS := /C
 else
-	CARGO := cargo
-	MKDIR := mkdir -p $(TARGET_DIR)
-	MOVE := mv -f
-	COPY := cp -f
-	RUN_FULL := $(TARGET_DIR)/$(TARGET_EXE)
+    MKDIR := mkdir -p $(TARGET_DIR)
+    MKDIR_BIN := mkdir -p $(TARGET_BIN_DIR)
+    MOVE := mv -f
+    COPY := cp -f
+    RUN_FULL := $(TARGET)
 endif
 
-.PHONY: all build release run clean help $(TARGET)
+.PHONY: all build release run clean help
 
 all: build run
 
-$(TARGET): 
+build: $(TARGET)
+
+$(TARGET):
 	@$(CARGO) build --bin lym
 	@$(MKDIR)
-ifeq ($(IS_WINDOWS_CMD),cmd.exe)
+	@$(MKDIR_BIN)
+ifeq ($(IS_WINDOWS),cmd.exe)
 	@$(MOVE) "$(LYM_DIR)\target\debug\$(TARGET_EXE)" "$(subst /,\\,$(TARGET_BIN))"
 	@$(COPY) "$(subst /,\\,$(TARGET_BIN))" "$(subst /,\\,$(TARGET_TMP))"
 	@$(MOVE) "$(subst /,\\,$(TARGET_TMP))" "$(subst /,\\,$(TARGET))"
@@ -41,12 +45,11 @@ else
 	@$(MOVE) "$(TARGET_TMP)" "$(TARGET)"
 endif
 
-build: $(TARGET)
-
 release:
 	@$(CARGO) build --release --bin lym
 	@$(MKDIR)
-ifeq ($(IS_WINDOWS_CMD),cmd.exe)
+	@$(MKDIR_BIN)
+ifeq ($(IS_WINDOWS),cmd.exe)
 	@$(MOVE) "$(LYM_DIR)\target\release\$(TARGET_EXE)" "$(subst /,\\,$(TARGET))"
 else
 	@$(MOVE) "$(LYM_DIR)/target/release/$(TARGET_EXE)" "$(TARGET)"
@@ -54,14 +57,15 @@ endif
 
 run: $(TARGET)
 	@$(MKDIR)
-	@$(RUN_FULL) $(filter-out $@,$(MAKECMDGOALS))
+	@$(MKDIR_BIN)
+	@$(RUN_FULL) $(ARGS)
 
 clean:
 	@$(CARGO) clean
-ifeq ($(IS_WINDOWS_CMD),cmd.exe)
-	@cmd /c "if exist $(subst /,\\,$(TARGET_DIR)) rmdir /s /q $(subst /,\\,$(TARGET_DIR))"
+ifeq ($(IS_WINDOWS),cmd.exe)
+	@cmd /c "if exist $(subst /,\\,$(TARGET_BIN_DIR)) rmdir /s /q $(subst /,\\,$(TARGET_BIN_DIR))"
 else
-	@rm -rf $(TARGET_DIR)
+	@rm -rf $(TARGET_BIN_DIR)
 endif
 
 help:
@@ -69,6 +73,6 @@ help:
 	@echo "  all      - build debug binary and run"
 	@echo "  build    - build debug binary"
 	@echo "  release  - build release binary"
-	@echo "  run      - run built binary"
+	@echo "  run      - run built binary (use 'make run ARGS=\"...\"')"
 	@echo "  clean    - clean build artifacts"
 	@echo "  help     - show this help message"
