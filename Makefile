@@ -6,6 +6,7 @@ TARGET_EXE := lym$(if $(IS_WINDOWS),.exe)
 TARGET := $(TARGET_DIR)/$(TARGET_EXE)
 TARGET_BIN := $(TARGET_BIN_DIR)/$(TARGET_EXE)
 TARGET_TMP := $(TARGET_EXE).tmp
+LYM_DIR := .
 
 CARGO := cargo
 
@@ -20,12 +21,12 @@ ifeq ($(IS_WINDOWS),cmd.exe)
 else
     MKDIR := mkdir -p $(TARGET_DIR)
     MKDIR_BIN := mkdir -p $(TARGET_BIN_DIR)
-    MOVE := mv -f
-    COPY := cp -f
+    MOVE := - mv -f
+    COPY := - cp -f
     RUN_FULL := $(TARGET)
 endif
 
-.PHONY: all build release run clean help
+.PHONY: all build release run clean help $(TARGET)
 
 all: build run
 
@@ -41,8 +42,6 @@ ifeq ($(IS_WINDOWS),cmd.exe)
 	@$(MOVE) "$(subst /,\\,$(TARGET_TMP))" "$(subst /,\\,$(TARGET))"
 else
 	@$(MOVE) "$(LYM_DIR)/target/debug/$(TARGET_EXE)" "$(TARGET_BIN)"
-	@$(COPY) "$(TARGET_BIN)" "$(TARGET_TMP)"
-	@$(MOVE) "$(TARGET_TMP)" "$(TARGET)"
 endif
 
 release:
@@ -58,7 +57,7 @@ endif
 run: $(TARGET)
 	@$(MKDIR)
 	@$(MKDIR_BIN)
-	@$(RUN_FULL) $(ARGS)
+	@$(TARGET_BIN) $(ARGS)
 
 clean:
 	@$(CARGO) clean

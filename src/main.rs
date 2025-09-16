@@ -1,7 +1,7 @@
 use colored::*;
 use std::env;
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
 use indicatif::{ProgressBar, ProgressStyle, self};
@@ -34,9 +34,13 @@ fn ensure_lym_dirs() -> io::Result<()> {
         fs::create_dir_all(&lym_dir)?;
     }
 
+    if !lym_dir.is_dir() {
+        return Err(io::Error::new(io::ErrorKind::Other, format!("{} exists and is not a directory", lym_dir.display())));
+    }
+
     let config_path = lym_dir.join("config.json");
     if !config_path.exists() {
-        File::create(&config_path)?.write_all(b"{}")?;
+        update_config_with_lucia_info(&config_path)?;
     }
 
     let logs_dir = lym_dir.join("logs");
@@ -284,13 +288,13 @@ fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Re
     let lucia_path_str = config_json.get("lucia_path")
         .and_then(JsonValue::as_str)
         .ok_or("Lucia path not set in config. Run lym config or reinstall lucia.")?;
-    let lucia_path = Path::new(lucia_path_str);
-
-    let libs_dir = lucia_path
-        .parent()
-        .and_then(|p| p.parent())
-        .unwrap_or(lucia_path)
-        .join("libs");
+        let lucia_path = Path::new(lucia_path_str);
+        let lucia_real = lucia_path.canonicalize().unwrap_or_else(|_| lucia_path.to_path_buf());
+        let libs_dir = lucia_real
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(&lucia_real)
+            .join("libs");
 
     if !libs_dir.exists() {
         if verbose {
@@ -535,11 +539,11 @@ fn move_packages(args: &[String], disable: bool) {
         });
 
     let lucia_path = Path::new(lucia_path_str);
-
-    let libs_dir = lucia_path
+    let lucia_real = lucia_path.canonicalize().unwrap_or_else(|_| lucia_path.to_path_buf());
+    let libs_dir = lucia_real
         .parent()
         .and_then(|p| p.parent())
-        .unwrap_or(lucia_path)
+        .unwrap_or(&lucia_real)
         .join("libs");
 
     let store_dir = lym_dir.join("store");
@@ -761,12 +765,12 @@ fn list(args: &[String]) {
         }
 
         let lucia_path = Path::new(lucia_path_str.unwrap());
-
-        let libs_dir = lucia_path
+        let lucia_real = lucia_path.canonicalize().unwrap_or_else(|_| lucia_path.to_path_buf());
+        let libs_dir = lucia_real
             .parent()
             .and_then(|p| p.parent())
-            .unwrap_or(lucia_path)
-            .join("libs");
+            .map(|env_root| env_root.join("libs"))
+            .unwrap_or_else(|| lucia_real.join("libs"));
 
         if !libs_dir.exists() || !libs_dir.is_dir() {
             eprintln!("{}", format!("libs directory not found at {}", libs_dir.display()).red());
@@ -1264,10 +1268,11 @@ fn remove(args: &[String]) {
     };
 
     let lucia_path = Path::new(lucia_path_str);
-    let libs_dir = lucia_path
+    let lucia_real = lucia_path.canonicalize().unwrap_or_else(|_| lucia_path.to_path_buf());
+    let libs_dir = lucia_real
         .parent()
         .and_then(|p| p.parent())
-        .unwrap_or(lucia_path)
+        .unwrap_or(&lucia_real)
         .join("libs");
 
     for pkg_name in packages {
@@ -1428,8 +1433,9 @@ fn config(args: &[String]) {
             };
 
             let lucia_path = Path::new(lucia_path_str);
-            match lucia_path.parent().and_then(|p| p.parent()) {
-                Some(parent) => parent.join("config.json"),
+            let lucia_real = lucia_path.canonicalize().unwrap_or_else(|_| lucia_path.to_path_buf());
+            match lucia_real.parent().map(|parent| parent.join("config.json")) {
+                Some(path) => path,
                 None => {
                     eprintln!("{}", "Could not resolve lucia config path.".red());
                     return;
@@ -1606,7 +1612,10 @@ fn modify(args: &[String]) {
             .get("lucia_path")
             .and_then(JsonValue::as_str)
             .map(PathBuf::from)
-            .and_then(|p| p.parent().and_then(|p| p.parent()).map(|env_root| env_root.join("libs").join(name)))
+            .and_then(|p| {
+                let real = p.canonicalize().unwrap_or_else(|_| p);
+                real.parent().and_then(|p| p.parent()).map(|env_root| env_root.join("libs").join(name))
+            })
         {
             Some(path) => path,
             None => {
@@ -1869,13 +1878,23 @@ fn main() {
     };
 
     let lucia_path = Path::new(lucia_path_str);
-    let libs_path = match lucia_path.parent().and_then(|p| p.parent()) {
-        Some(parent) => parent.join("libs.json"),
+    // Resolve symlinks for lucia_path
+    let lucia_real_path = match lucia_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{}", format!("Failed to resolve lucia symlink: {}", e).red());
+            return;
+        }
+    };
+    let libs_path = match lucia_real_path.parent().and_then(|p| p.parent()) {
+        Some(env_root) => env_root.join("libs.json"),
         None => {
             eprintln!("{}", "Could not resolve lucia config path.".red());
             return;
         }
     };
+
+    dbg!(libs_path.display());
 
     if let Err(err) = load_std_libs(&libs_path) {
         eprintln!("{}", format!("Failed to load standard libraries: {}", err).red());
