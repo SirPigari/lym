@@ -279,6 +279,24 @@ fn command_help(cmd: &str) {
 }
 
 fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Result<(), String> {
+    if cfg!(target_os = "windows") {
+        let output = Command::new("tasklist")
+            .output()
+            .map_err(|e| format!("Failed to execute tasklist: {}", e))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.lines().any(|line| line.to_lowercase().starts_with("lucia.exe")) {
+            return Err("Lucia is currently running. Please close it before installing packages.".to_string());
+        }
+    } else {
+        let output = Command::new("pgrep")
+            .arg("lucia")
+            .output()
+            .map_err(|e| format!("Failed to execute pgrep: {}", e))?;
+        if !output.stdout.is_empty() {
+            return Err("Lucia is currently running. Please close it before installing packages.".to_string());
+        }
+    }
+
     let lym_dir = get_lym_dir().map_err(|e| format!("Failed to get lym dir: {}", e))?;
     let config_path = lym_dir.join("config.json");
     let config_json: JsonValue = fs::read_to_string(&config_path)
@@ -1214,6 +1232,38 @@ fn remove(args: &[String]) {
         exit(1);
     }
 
+    if cfg!(target_os = "windows") {
+        let output = match Command::new("tasklist")
+            .output()
+            .map_err(|e| format!("Failed to execute tasklist: {}", e)) {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!("{}", e.red());
+                exit(1);
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.lines().any(|line| line.to_lowercase().starts_with("lucia.exe")) {
+            eprintln!("{}", "Lucia is currently running. Please close it before removing packages.".red());
+            exit(1);
+        }
+    } else {
+        let output = match Command::new("pgrep")
+            .arg("lucia")
+            .output()
+            .map_err(|e| format!("Failed to execute pgrep: {}", e)) {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!("{}", e.red());
+                exit(1);
+            }
+        };
+        if !output.stdout.is_empty() {
+            eprintln!("{}", "Lucia is currently running. Please close it before removing packages.".red());
+            exit(1);
+        }
+    }
+
     let mut verbose = false;
     let mut no_confirm = false;
     let mut packages = vec![];
@@ -1893,8 +1943,6 @@ fn main() {
             return;
         }
     };
-
-    dbg!(libs_path.display());
 
     if let Err(err) = load_std_libs(&libs_path) {
         eprintln!("{}", format!("Failed to load standard libraries: {}", err).red());
