@@ -148,4 +148,14 @@ public final fun clear_temps():
     end
 end
 
-// play_sound("miku.mp3")
+public final fun test():
+    // Test function to demonstrate sound playback.
+    //
+    // Parameters:
+    //     None
+    //
+    // Returns:
+    //     void
+    play_sound("miku.mp3", sync = true)
+    clear_temps()
+end
