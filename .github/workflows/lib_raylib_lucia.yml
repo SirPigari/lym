@@ -55,7 +55,8 @@ jobs:
         run: |
           mkdir -p raylib/build
           cd raylib/build
-          cmake -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release ..
+          cmake -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=./lib ..
           cmake --build . --config Release
         shell: bash
 
@@ -66,15 +67,15 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           mkdir raylib\build
           cd raylib\build
-          cmake -G "Visual Studio 17 2022" -A x64 -DBUILD_SHARED_LIBS=ON -DBUILD_EXAMPLES=OFF ..
+          cmake -G "Visual Studio 17 2022" -A x64 -DBUILD_SHARED_LIBS=ON -DBUILD_EXAMPLES=OFF \
+                -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=.\lib ..
           cmake --build . --config Release
 
       - name: Upload built lib
         uses: actions/upload-artifact@v4
         with:
           name: raylib-${{ steps.libname.outputs.ext }}
-          path: |
-            raylib/build/Release/raylib.${{ steps.libname.outputs.ext }} || raylib/build/libraylib.${{ steps.libname.outputs.ext }}
+          path: raylib/build/lib/*
 
   bundle:
     needs: build
@@ -90,12 +91,15 @@ jobs:
       - name: Reorganize into zip/ folder
         run: |
           mkdir -p zip
-          cp artifacts/raylib-dll/raylib.dll zip/ || true
-          cp artifacts/raylib-so/libraylib.so zip/ || true
-          cp artifacts/raylib-dylib/libraylib.dylib zip/ || true
+          cp artifacts/*/* zip/ || true
 
       - name: Create zip file
-        run: zip -j raylib-shared-libs.zip zip/*
+        run: |
+          if [ "$(ls -A zip)" ]; then
+            zip -j raylib-shared-libs.zip zip/*
+          else
+            echo "No files to zip."
+          fi
 
       - name: Upload zip bundle
         uses: actions/upload-artifact@v4
