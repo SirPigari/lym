@@ -21,9 +21,13 @@ jobs:
 
       - name: Extract prebuilt libraries
         run: |
-          unzip prebuilt/raylib-win.zip -d prebuilt/win
-          tar -xvzf prebuilt/raylib-linux.tar.gz -C prebuilt/linux
-          tar -xvzf prebuilt/raylib-macos.tar.gz -C prebuilt/macos
+            mkdir -p prebuilt/win
+            mkdir -p prebuilt/linux
+            mkdir -p prebuilt/macos
+            unzip prebuilt/raylib-win.zip -d prebuilt/win
+            tar -xvzf prebuilt/raylib-linux.tar.gz -C prebuilt/linux
+            tar -xvzf prebuilt/raylib-macos.tar.gz -C prebuilt/macos
+
 
       - name: Reorganize into zip/ folder
         run: |
