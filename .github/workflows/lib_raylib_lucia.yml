@@ -39,14 +39,13 @@ jobs:
         run: |
           if [[ "${{ runner.os }}" == "Linux" ]]; then
             sudo apt update
-            sudo apt install -y \
-              libx11-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev \
-              libgl1-mesa-dev libglu1-mesa-dev build-essential cmake
+            sudo apt install -y libx11-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev \
+                                libgl1-mesa-dev libglu1-mesa-dev build-essential cmake zip
           elif [[ "${{ runner.os }}" == "macOS" ]]; then
             brew update
-            brew install cmake glfw
+            brew install cmake glfw zip
           elif [[ "${{ runner.os }}" == "Windows" ]]; then
-            choco install cmake --installargs '"ADD_CMAKE_TO_PATH=System"' -y
+            choco install cmake zip --installargs '"ADD_CMAKE_TO_PATH=System"' -y
           fi
         shell: bash
 
@@ -56,20 +55,23 @@ jobs:
           mkdir -p raylib/build
           cd raylib/build
           cmake -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=./lib ..
+                -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=./lib ..
           cmake --build . --config Release
+          echo "Contents of lib folder:"
+          ls -l ./lib
         shell: bash
 
       - name: Build Raylib shared lib (Windows)
         if: runner.os == 'Windows'
         shell: cmd
         run: |
-            call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-            mkdir raylib\build
-            cd raylib\build
-            cmake -G "Visual Studio 17 2022" -A x64 -DBUILD_SHARED_LIBS=ON -DBUILD_EXAMPLES=OFF -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=.\lib ..
-            cmake --build . --config Release
-
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          mkdir raylib\build
+          cd raylib\build
+          cmake -G "Visual Studio 17 2022" -A x64 -DBUILD_SHARED_LIBS=ON -DBUILD_EXAMPLES=OFF \
+                -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=.\lib ..
+          cmake --build . --config Release
+          dir lib
 
       - name: Upload built lib
         uses: actions/upload-artifact@v4
@@ -79,8 +81,8 @@ jobs:
 
   bundle:
     needs: build
-    timeout-minutes: 0
     runs-on: ubuntu-latest
+    timeout-minutes: 0
 
     steps:
       - name: Download all artifacts
@@ -92,6 +94,8 @@ jobs:
         run: |
           mkdir -p zip
           cp artifacts/*/* zip/ || true
+          echo "Contents of zip folder:"
+          ls -l zip
 
       - name: Create zip file
         run: |
