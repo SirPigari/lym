@@ -32,9 +32,15 @@ match (os.os_name()):
     end
 end
 
-private final init_window_c: &int = libload.get_fn(lib, "init_window", [
+private final init_window_c: &int = libload.get_fn(lib, "InitWindow", [
     "int", "int", "str"
 ], "void")
+private final close_window_c: &int = libload.get_fn(lib, "CloseWindow", [], "void")
+private final window_should_close_c: &int = libload.get_fn(lib, "WindowShouldClose", [], "int")
+private final begin_drawing_c: &int = libload.get_fn(lib, "BeginDrawing", [], "void")
+private final end_drawing_c: &int = libload.get_fn(lib, "EndDrawing", [], "void")
+private final clear_background_c: &int = libload.get_fn(lib, "ClearBackground", ["ptr"], "void")
+private final draw_text_c: &int = libload.get_fn(lib, "DrawText", ["str", "int", "int", "int", "ptr"], "void")
 
 public final fun init_window(
     width: int,
@@ -57,6 +63,141 @@ public final fun init_window(
     return null
 end
 
+public final fun close_window() -> void:
+    /// Closes the window and unloads OpenGL context.
+    ///     @return: void - No return value.
+    if (close_window_c == null):
+        throw "Function 'close_window' not found in the loaded library." from "FunctionNotFoundError"
+    end
+    libload.call_fn(close_window_c, [])
+    return null
+end
+
+public final fun window_should_close() -> bool:
+    /// Checks if the window should close (if the close button was pressed).
+    ///     @return: bool - True if the window should close, false otherwise.
+    if (window_should_close_c == null):
+        throw "Function 'window_should_close' not found in the loaded library." from "FunctionNotFoundError"
+    end
+    result: int = libload.call_fn(window_should_close_c, [])
+    return result != 0
+end
+
+public final fun begin_drawing() -> void:
+    /// Begins drawing to the window.
+    ///     @return: void - No return value.
+    if (begin_drawing_c == null):
+        throw "Function 'begin_drawing' not found in the loaded library." from "FunctionNotFoundError"
+    end
+    libload.call_fn(begin_drawing_c, [])
+    return null
+end
+
+public final fun end_drawing() -> void:
+    /// Ends drawing to the window.
+    ///     @return: void - No return value.
+    if (end_drawing_c == null):
+        throw "Function 'end_drawing' not found in the loaded library." from "FunctionNotFoundError"
+    end
+    libload.call_fn(end_drawing_c, [])
+    return null
+end
+
+public final fun clear_background(color: tuple[int; 4]) -> void:
+    /// Clears the background with the specified color.
+    ///     @param color: list[int] - A list of 4 integers representing RGBA color (0-255).
+    ///     @return: void - No return value.
+    if (clear_background_c == null):
+        throw "Function 'clear_background' not found in the loaded library." from "FunctionNotFoundError"
+    end
+    if (len(color) != 4):
+        throw "Color must be a list of 4 integers (RGBA)." from "ValueError"
+    end
+    for (c in color):
+        if (c < 0 || c > 255):
+            throw "Color values must be in the range 0-255." from "ValueError"
+        end
+    end
+    _color := libload.create_struct([color[0], color[1], color[2], color[3]], ["byte", "byte", "byte", "byte"], packed=true)
+    if (_color == null):
+        throw "Invalid pointer: null" from "PointerError"
+    end
+    libload.call_fn(clear_background_c, [_color])
+    return null
+end
+
+public final fun draw_text(
+    text: str,
+    pos_x: int,
+    pos_y: int,
+    font_size: int,
+    color: tuple[int; 4],
+) -> void:
+    /// Draws text on the screen at the specified position, size, and color.
+    ///     @param text: str - The text to draw.
+    ///     @param pos_x: int - The x position to draw the text.
+    ///     @param pos_y: int - The y position to draw the text.
+    ///     @param font_size: int - The font size of the text.
+    ///     @param color: list[int] - A list of 4 integers representing RGBA color (0-255).
+    ///     @return: void - No return value.
+    if (draw_text_c == null):
+        throw "Function 'draw_text' not found in the loaded library." from "FunctionNotFoundError"
+    end
+    if (len(color) != 4):
+        throw "Color must be a list of 4 integers (RGBA)." from "ValueError"
+    end
+    for (c in color):
+        if (c < 0 || c > 255):
+            throw "Color values must be in the range 0-255." from "ValueError"
+        end
+    end
+    _text: &int = libload.create_str_ptr(text)
+    if (_text == null):
+        throw "Invalid pointer: null" from "PointerError"
+    end
+    _color := libload.create_struct([color[0], color[1], color[2], color[3]], ["byte", "byte", "byte", "byte"], packed=true)
+    print(_color.to_string())
+    if (_color == null):
+        throw "Invalid pointer: null" from "PointerError"
+    end
+    libload.call_fn(draw_text_c, [_text, pos_x, pos_y, font_size, _color])
+    return null
+end
+
 
 // Function Aliases
-public final InitWindow = init_window
+public final InitWindow: &int = init_window
+public final CloseWindow: &int = close_window
+public final WindowShouldClose: &int = window_should_close
+public final BeginDrawing: &int = begin_drawing
+public final EndDrawing: &int = end_drawing
+public final ClearBackground: &int = clear_background
+public final DrawText: &int = draw_text
+
+// Color Constants
+public final LIGHTGRAY: tuple[int; 4]  = (200, 200, 200, 255)
+public final GRAY: tuple[int; 4]       = (130, 130, 130, 255)
+public final DARKGRAY: tuple[int; 4]   = (80, 80, 80, 255)
+public final YELLOW: tuple[int; 4]     = (253, 249, 0, 255)
+public final GOLD: tuple[int; 4]       = (255, 203, 0, 255)
+public final ORANGE: tuple[int; 4]     = (255, 161, 0, 255)
+public final PINK: tuple[int; 4]       = (255, 109, 194, 255)
+public final RED: tuple[int; 4]        = (230, 41, 55, 255)
+public final MAROON: tuple[int; 4]     = (190, 33, 55, 255)
+public final GREEN: tuple[int; 4]      = (0, 228, 48, 255)
+public final LIME: tuple[int; 4]       = (0, 158, 47, 255)
+public final DARKGREEN: tuple[int; 4]  = (0, 117, 44, 255)
+public final SKYBLUE: tuple[int; 4]    = (102, 191, 255, 255)
+public final BLUE: tuple[int; 4]       = (0, 121, 241, 255)
+public final DARKBLUE: tuple[int; 4]   = (0, 82, 172, 255)
+public final PURPLE: tuple[int; 4]     = (200, 122, 255, 255)
+public final VIOLET: tuple[int; 4]     = (135, 60, 190, 255)
+public final DARKPURPLE: tuple[int; 4] = (112, 31, 126, 255)
+public final BEIGE: tuple[int; 4]      = (211, 176, 131, 255)
+public final BROWN: tuple[int; 4]      = (127, 106, 79, 255)
+public final DARKBROWN: tuple[int; 4]  = (76, 63, 47, 255)
+public final WHITE: tuple[int; 4]      = (255, 255, 255, 255)
+public final BLACK: tuple[int; 4]      = (0, 0, 0, 255)
+public final BLANK: tuple[int; 4]      = (0, 0, 0, 0)
+public final MAGENTA: tuple[int; 4]    = (255, 0, 255, 255)
+public final RAYWHITE: tuple[int; 4]   = (245, 245, 245, 255)
