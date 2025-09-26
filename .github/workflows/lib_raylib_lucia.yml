@@ -1,4 +1,4 @@
-name: raylib-lucia - Build shared libs
+name: raylib-lucia - Use prebuilt shared libs
 
 on:
   push:
@@ -7,95 +7,22 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 0
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    outputs:
-      artifact_name: zip-artifact
-
-    steps:
-      - name: Checkout Lucia repo
-        uses: actions/checkout@v3
-
-      - name: Clone Raylib
-        run: git clone --depth 1 https://github.com/raysan5/raylib.git raylib
-
-      - name: Set shared lib extension
-        id: libname
-        run: |
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            echo "ext=dll" >> $GITHUB_OUTPUT
-          elif [[ "${{ runner.os }}" == "macOS" ]]; then
-            echo "ext=dylib" >> $GITHUB_OUTPUT
-          else
-            echo "ext=so" >> $GITHUB_OUTPUT
-          fi
-        shell: bash
-
-      - name: Install dependencies
-        run: |
-          if [[ "${{ runner.os }}" == "Linux" ]]; then
-            sudo apt update
-            sudo apt install -y libx11-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev \
-                                libgl1-mesa-dev libglu1-mesa-dev build-essential cmake zip
-          elif [[ "${{ runner.os }}" == "macOS" ]]; then
-            brew update
-            brew install cmake glfw zip
-          elif [[ "${{ runner.os }}" == "Windows" ]]; then
-            choco install cmake zip --installargs '"ADD_CMAKE_TO_PATH=System"' -y
-          fi
-        shell: bash
-
-      - name: Build Raylib shared lib (Linux/macOS)
-        if: runner.os != 'Windows'
-        run: |
-          mkdir -p raylib/build
-          cd raylib/build
-          cmake -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=./lib ..
-          cmake --build . --config Release
-          echo "Contents of lib folder:"
-          ls -l ./lib
-        shell: bash
-
-      - name: Build Raylib shared lib (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          mkdir raylib\build
-          cd raylib\build
-          cmake -G "Visual Studio 17 2022" -A x64 -DBUILD_SHARED_LIBS=ON -DBUILD_EXAMPLES=OFF \
-                -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=.\lib ..
-          cmake --build . --config Release
-          dir lib
-
-      - name: Upload built lib
-        uses: actions/upload-artifact@v4
-        with:
-          name: raylib-${{ steps.libname.outputs.ext }}
-          path: raylib/build/lib/*
-
   bundle:
-    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 0
 
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
+      - name: Download prebuilt libraries
+        run: |
+          mkdir -p prebuilt
+          curl -L -o prebuilt/raylib.dll  https://example.com/raylib/windows/raylib.dll
+          curl -L -o prebuilt/libraylib.so https://example.com/raylib/linux/libraylib.so
+          curl -L -o prebuilt/libraylib.dylib https://example.com/raylib/macos/libraylib.dylib
 
       - name: Reorganize into zip/ folder
         run: |
           mkdir -p zip
-          cp artifacts/*/* zip/ || true
-          echo "Contents of zip folder:"
-          ls -l zip
+          cp prebuilt/* zip/
 
       - name: Create zip file
         run: |
