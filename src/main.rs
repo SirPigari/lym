@@ -8,6 +8,7 @@ use indicatif::{ProgressBar, ProgressStyle, self};
 use dialoguer::{Confirm, self};
 use std::time::Duration;
 use serde_json::{Value as JsonValue, json};
+use getch_rs::{Getch, Key};
 use reqwest::blocking::Client;
 use base64::{engine::general_purpose, Engine as _};
 
@@ -15,7 +16,7 @@ mod db;
 mod utils;
 
 use db::{STD_LIBS, load_std_libs};
-use utils::check_version;
+use utils::{check_version, parse_bytes, json_type};
 
 // lym - Lucia package manager
 // 'lym' isnt an acronym if you were wondering
@@ -278,23 +279,102 @@ fn command_help(cmd: &str) {
     }
 }
 
-fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Result<(), String> {
-    if cfg!(target_os = "windows") {
+pub fn check_and_close_lucia(no_confirm: bool) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let processes: Vec<u32> = {
         let output = Command::new("tasklist")
             .output()
             .map_err(|e| format!("Failed to execute tasklist: {}", e))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.lines().any(|line| line.to_lowercase().starts_with("lucia.exe")) {
-            return Err("Lucia is currently running. Please close it before installing packages.".to_string());
-        }
-    } else {
+        stdout.lines()
+            .filter(|line| line.to_lowercase().starts_with("lucia.exe"))
+            .filter_map(|line| line.split_whitespace().nth(1)?.parse::<u32>().ok())
+            .collect()
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let processes: Vec<u32> = {
         let output = Command::new("pgrep")
             .arg("lucia")
             .output()
             .map_err(|e| format!("Failed to execute pgrep: {}", e))?;
-        if !output.stdout.is_empty() {
-            return Err("Lucia is currently running. Please close it before installing packages.".to_string());
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect()
+    };
+
+    if processes.is_empty() {
+        return Ok(());
+    }
+
+    if no_confirm {
+        for pid in &processes {
+            #[cfg(target_os = "windows")]
+            { let _ = Command::new("taskkill").args(&["/PID", &pid.to_string(), "/F"]).status(); }
+            #[cfg(not(target_os = "windows"))]
+            { let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status(); }
         }
+        println!("All running Lucia processes were closed automatically.");
+        return Ok(());
+    }
+
+    let mut close_all = false;
+    let g = Getch::new();
+
+    for pid in &processes {
+        if close_all {
+            #[cfg(target_os = "windows")]
+            { let _ = Command::new("taskkill").args(&["/PID", &pid.to_string(), "/F"]).status(); }
+            #[cfg(not(target_os = "windows"))]
+            { let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status(); }
+            continue;
+        }
+
+        loop {
+            print!("Lucia process {} is running. Close it? ([Y]es/[A]ll/[N]one) ", pid);
+            use std::io::{stdout, Write};
+            stdout().flush().unwrap();
+
+            let choice = match g.getch() {
+                Ok(Key::Char(c)) => c.to_ascii_lowercase(),
+                Ok(Key::Esc) => 'n',
+                _ => continue,
+            };
+            println!();
+
+            match choice {
+                'y' => {
+                    #[cfg(target_os = "windows")]
+                    { let _ = Command::new("taskkill").args(&["/PID", &pid.to_string(), "/F"]).status(); }
+                    #[cfg(not(target_os = "windows"))]
+                    { let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status(); }
+                    break;
+                }
+                'a' => {
+                    close_all = true;
+                    #[cfg(target_os = "windows")]
+                    { let _ = Command::new("taskkill").args(&["/PID", &pid.to_string(), "/F"]).status(); }
+                    #[cfg(not(target_os = "windows"))]
+                    { let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status(); }
+                    break;
+                }
+                'n' => return Err("Lucia is currently running. Please close it before installing packages.".to_string()),
+                _ => {
+                    println!("Please press Y, A, or N.");
+                    continue;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Result<(), String> {
+    match check_and_close_lucia(no_confirm) {
+        Ok(_) => {}
+        Err(e) => return Err(e),
     }
 
     let lym_dir = get_lym_dir().map_err(|e| format!("Failed to get lym dir: {}", e))?;
@@ -306,13 +386,13 @@ fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Re
     let lucia_path_str = config_json.get("lucia_path")
         .and_then(JsonValue::as_str)
         .ok_or("Lucia path not set in config. Run lym config or reinstall lucia.")?;
-        let lucia_path = Path::new(lucia_path_str);
-        let lucia_real = lucia_path.canonicalize().unwrap_or_else(|_| lucia_path.to_path_buf());
-        let libs_dir = lucia_real
-            .parent()
-            .and_then(|p| p.parent())
-            .unwrap_or(&lucia_real)
-            .join("libs");
+    let lucia_path = Path::new(lucia_path_str);
+    let lucia_real = lucia_path.canonicalize().unwrap_or_else(|_| lucia_path.to_path_buf());
+    let libs_dir = lucia_real
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(&lucia_real)
+        .join("libs");
 
     if !libs_dir.exists() {
         if verbose {
@@ -349,7 +429,7 @@ fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Re
 
     let manifest_url = format!("https://api.github.com/repos/{}/contents/libs/{}/manifest.json", repo_slug, pkg_name);
     let client = Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
@@ -480,7 +560,7 @@ fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Re
                 pb.set_message(format!("Downloading file {}", name));
             }
 
-            let file_resp = client.get(download_url)
+            let mut file_resp = client.get(download_url)
                 .header("User-Agent", "lym-install")
                 .send()
                 .map_err(|e| format!("Failed to download file {}: {}", name, e))?;
@@ -491,11 +571,11 @@ fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Re
                 continue;
             }
 
-            let file_bytes = file_resp.bytes()
-                .map_err(|e| format!("Failed to read bytes of file {}: {}", name, e))?;
-
             let local_file_path = local_pkg_path.join(name);
-            fs::write(&local_file_path, &file_bytes)
+            let mut out_file = std::fs::File::create(&local_file_path)
+                .map_err(|e| format!("Failed to create file {}: {}", local_file_path.display(), e))?;
+
+            file_resp.copy_to(&mut out_file)
                 .map_err(|e| format!("Failed to write file {}: {}", local_file_path.display(), e))?;
         }
         else if item_type == "dir" {
@@ -1232,38 +1312,6 @@ fn remove(args: &[String]) {
         exit(1);
     }
 
-    if cfg!(target_os = "windows") {
-        let output = match Command::new("tasklist")
-            .output()
-            .map_err(|e| format!("Failed to execute tasklist: {}", e)) {
-            Ok(output) => output,
-            Err(e) => {
-                eprintln!("{}", e.red());
-                exit(1);
-            }
-        };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.lines().any(|line| line.to_lowercase().starts_with("lucia.exe")) {
-            eprintln!("{}", "Lucia is currently running. Please close it before removing packages.".red());
-            exit(1);
-        }
-    } else {
-        let output = match Command::new("pgrep")
-            .arg("lucia")
-            .output()
-            .map_err(|e| format!("Failed to execute pgrep: {}", e)) {
-            Ok(output) => output,
-            Err(e) => {
-                eprintln!("{}", e.red());
-                exit(1);
-            }
-        };
-        if !output.stdout.is_empty() {
-            eprintln!("{}", "Lucia is currently running. Please close it before removing packages.".red());
-            exit(1);
-        }
-    }
-
     let mut verbose = false;
     let mut no_confirm = false;
     let mut packages = vec![];
@@ -1277,6 +1325,14 @@ fn remove(args: &[String]) {
                 return;
             }
             pkg => packages.push(pkg.to_string()),
+        }
+    }
+
+    match check_and_close_lucia(no_confirm) {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("{} {}", "Error:".red(), e);
+            exit(1);
         }
     }
 
@@ -1404,7 +1460,7 @@ fn config(args: &[String]) {
         return;
     }
 
-    let mut set_pair: Option<(String, String)> = None;
+    let mut set_pairs: Vec<(String, String)> = Vec::new();
     let mut get_key: Option<String> = None;
     let mut no_confirm = false;
 
@@ -1417,20 +1473,18 @@ fn config(args: &[String]) {
             }
             "--set" => {
                 i += 1;
-                if i >= args.len() {
-                    eprintln!("{}", "--set requires a <key=value> argument.".red());
-                    return;
+                while i < args.len() && !args[i].starts_with("--") {
+                    let kv = &args[i];
+                    if let Some(pos) = kv.find('=') {
+                        let key = kv[..pos].to_string();
+                        let value = kv[pos + 1..].to_string();
+                        set_pairs.push((key, value));
+                    } else {
+                        eprintln!("{}", "--set arguments must be in key=value format.".red());
+                        return;
+                    }
+                    i += 1;
                 }
-                let kv = &args[i];
-                if let Some(pos) = kv.find('=') {
-                    let key = kv[..pos].to_string();
-                    let value = kv[pos + 1..].to_string();
-                    set_pair = Some((key, value));
-                } else {
-                    eprintln!("{}", "--set argument must be in key=value format.".red());
-                    return;
-                }
-                i += 1;
             }
             "--get" => {
                 i += 1;
@@ -1448,12 +1502,12 @@ fn config(args: &[String]) {
         }
     }
 
-    if set_pair.is_some() && get_key.is_some() && target != "fetch" {
+    if !set_pairs.is_empty() && get_key.is_some() && target != "fetch" {
         eprintln!("{}", "Cannot use --set and --get together.".red());
         return;
     }
 
-    if set_pair.is_none() && get_key.is_none() && target != "fetch" {
+    if set_pairs.is_empty() && get_key.is_none() && target != "fetch" {
         eprintln!("{}", "You must provide either --set or --get.".red());
         return;
     }
@@ -1484,8 +1538,18 @@ fn config(args: &[String]) {
 
             let lucia_path = Path::new(lucia_path_str);
             let lucia_real = lucia_path.canonicalize().unwrap_or_else(|_| lucia_path.to_path_buf());
-            match lucia_real.parent().map(|parent| parent.join("config.json")) {
-                Some(path) => path,
+            match lucia_real
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.join("config.json"))
+            {
+                Some(path) => {
+                    if !path.exists() {
+                        eprintln!("{}", format!("Lucia config not found at {}", path.display()).red());
+                        return;
+                    }
+                    path
+                }
                 None => {
                     eprintln!("{}", "Could not resolve lucia config path.".red());
                     return;
@@ -1537,7 +1601,7 @@ fn config(args: &[String]) {
         return;
     }    
 
-    if let Some((key, value)) = set_pair {
+    if !set_pairs.is_empty() {
         let mut config_json: serde_json::Map<String, JsonValue> = if config_path.exists() {
             match fs::read_to_string(&config_path)
                 .ok()
@@ -1553,20 +1617,34 @@ fn config(args: &[String]) {
             serde_json::Map::new()
         };
 
-        if config_json.contains_key(&key) && !no_confirm {
-            let confirm = Confirm::new()
-                .with_prompt(format!("Key '{}' exists, overwrite?", key))
-                .default(false)
-                .interact()
-                .unwrap_or(false);
+        for (key, value) in set_pairs {
+            if config_json.contains_key(&key) && !no_confirm {
+                let confirm = Confirm::new()
+                    .with_prompt(format!("Key '{}' exists, overwrite?", key))
+                    .default(false)
+                    .interact()
+                    .unwrap_or(false);
 
-            if !confirm {
-                println!("{}", "Aborted.".yellow());
-                return;
+                if !confirm {
+                    println!("{}", "Aborted.".yellow());
+                    return;
+                }
             }
-        }
 
-        config_json.insert(key, JsonValue::String(value));
+            let parsed_val = if let Some(num) = parse_bytes(&value) {
+                if num <= u64::MAX as u128 {
+                    JsonValue::Number(serde_json::Number::from(num as u64))
+                } else {
+                    JsonValue::String(value)
+                }
+            } else if let Ok(num) = value.parse::<i64>() {
+                JsonValue::Number(serde_json::Number::from(num))
+            } else {
+                JsonValue::String(value)
+            };
+
+            config_json.insert(key, parsed_val);
+        }
 
         let json_str = match serde_json::to_string_pretty(&config_json) {
             Ok(s) => s,
@@ -1589,7 +1667,7 @@ fn config(args: &[String]) {
             .unwrap_or_else(|| json!({}));
 
         match config_json.get(&key) {
-            Some(val) => println!("{}", val),
+            Some(val) => println!("{} ({})", val, json_type(val)),
             None => eprintln!("{}", format!("Key '{}' not found in config.", key).yellow()),
         }
     }
@@ -1928,7 +2006,6 @@ fn main() {
     };
 
     let lucia_path = Path::new(lucia_path_str);
-    // Resolve symlinks for lucia_path
     let lucia_real_path = match lucia_path.canonicalize() {
         Ok(p) => p,
         Err(e) => {

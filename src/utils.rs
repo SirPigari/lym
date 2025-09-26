@@ -11,6 +11,49 @@ fn version_to_tuple(v: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
+pub fn parse_bytes(input: &str) -> Option<u128> {
+    let input = input.trim().to_lowercase();
+
+    let (num_str, unit_str) = input
+        .trim()
+        .chars()
+        .partition::<String, _>(|c| c.is_ascii_digit() || *c == '.');
+
+    let number: f64 = num_str.parse().ok()?;
+
+    let multiplier: u128 = match unit_str.trim() {
+        "" | "b"       => 1,
+        "kb"           => 1000,
+        "mb"           => 1000u128.pow(2),
+        "gb"           => 1000u128.pow(3),
+        "tb"           => 1000u128.pow(4),
+        "pb" | "pt"    => 1000u128.pow(5),
+        "eb"           => 1000u128.pow(6),
+
+        "kib"          => 1024,
+        "mib"          => 1024u128.pow(2),
+        "gib"          => 1024u128.pow(3),
+        "tib"          => 1024u128.pow(4),
+        "pib"          => 1024u128.pow(5),
+        "eib"          => 1024u128.pow(6),
+
+        _ => return None,
+    };
+
+    Some((number * multiplier as f64) as u128)
+}
+
+pub fn json_type(val: &serde_json::Value) -> &'static str {
+    match val {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 fn cmp_version(a: (u64,u64,u64), b: (u64,u64,u64)) -> Ordering {
     if a.0 != b.0 {
         return a.0.cmp(&b.0);
