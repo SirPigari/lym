@@ -34,16 +34,27 @@ jobs:
           fi
         shell: bash
 
+      - name: Install dependencies
+        run: |
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            sudo apt update
+            sudo apt install -y \
+              libx11-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev \
+              libgl1-mesa-dev libglu1-mesa-dev build-essential cmake
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            brew update
+            brew install cmake glfw
+          elif [[ "${{ runner.os }}" == "Windows" ]]; then
+            choco install cmake --installargs '"ADD_CMAKE_TO_PATH=System"' -y
+          fi
+        shell: bash
+
       - name: Build Raylib shared lib (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
           mkdir -p raylib/build
           cd raylib/build
-          if [[ "${{ runner.os }}" == "macOS" ]]; then
-            cmake -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release ..
-          else
-            cmake -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release ..
-          fi
+          cmake -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release ..
           cmake --build . --config Release
         shell: bash
 
