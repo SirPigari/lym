@@ -10,22 +10,22 @@ private mutable lib: ?&int = null
 fs.change_dir(__dir__)
 match (os.os_name()):
     "Windows":
-        if (!fs.file_exists("raylib.dll")):
+        if (!fs.file_exists(__dir__ + "raylib.dll")):
             throw "raylib.dll not found in the current directory." from "FileNotFoundError"
         end
-        lib = libload.load_lib("raylib.dll")
+        lib = libload.load_lib(__dir__ + "raylib.dll")
     end
     "Linux":
-        if (!fs.file_exists("raylib.so")):
+        if (!fs.file_exists(__dir__ + "raylib.so")):
             throw "raylib.so not found in the current directory." from "FileNotFoundError"
         end
-        lib = libload.load_lib("raylib.so")
+        lib = libload.load_lib(__dir__ + "raylib.so")
     end
     "Darwin":
-        if (!fs.file_exists("raylib.dylib")):
+        if (!fs.file_exists(__dir__ + "raylib.dylib")):
             throw "raylib.dylib not found in the current directory." from "FileNotFoundError"
         end
-        lib = libload.load_lib("raylib.dylib")
+        lib = libload.load_lib(__dir__ + "raylib.dylib")
     end
     _ ->
         throw f"Unsupported OS: {os.os_name()}" from "UnsupportedOSError"
