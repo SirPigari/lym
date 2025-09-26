@@ -1,4 +1,4 @@
-name: raylib-lucia - Use prebuilt shared libs
+name: raylib-lucia - Use Prebuilt Shared Libraries
 
 on:
   push:
@@ -15,9 +15,14 @@ jobs:
       - name: Download prebuilt libraries
         run: |
           mkdir -p prebuilt
-          curl -L -o prebuilt/raylib.dll  https://example.com/raylib/windows/raylib.dll
-          curl -L -o prebuilt/libraylib.so https://example.com/raylib/linux/libraylib.so
-          curl -L -o prebuilt/libraylib.dylib https://example.com/raylib/macos/libraylib.dylib
+          curl -L -o prebuilt/raylib.dll https://github.com/raysan5/raylib/releases/download/5.5/raylib-5.5_win64_msvc16.zip
+          curl -L -o prebuilt/libraylib.so https://github.com/raysan5/raylib/releases/download/5.5/raylib-5.5_linux_amd64.tar.gz
+          curl -L -o prebuilt/libraylib.dylib https://github.com/raysan5/raylib/releases/download/5.5/raylib-5.5_macos.tar.gz
+
+      - name: Extract Linux and macOS libraries
+        run: |
+          tar -xvzf prebuilt/libraylib.so -C prebuilt
+          tar -xvzf prebuilt/libraylib.dylib -C prebuilt
 
       - name: Reorganize into zip/ folder
         run: |
@@ -27,7 +32,7 @@ jobs:
       - name: Create zip file
         run: |
           if [ "$(ls -A zip)" ]; then
-            zip -j raylib-shared-libs.zip zip/*
+            zip -r raylib-shared-libs.zip zip/*
           else
             echo "No files to zip."
           fi
