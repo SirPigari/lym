@@ -1,0 +1,62 @@
+import libload
+import os
+import fs
+
+// Raylib binding for Lucia
+// This library supports Windows, Linux, and macOS platforms.
+
+private mutable lib: ?&int = null
+
+fs.change_dir(__dir__)
+match (os.os_name()):
+    "Windows":
+        if (!fs.file_exists("raylib.dll")):
+            throw "raylib.dll not found in the current directory." from "FileNotFoundError"
+        end
+        lib = libload.load_lib("raylib.dll")
+    end
+    "Linux":
+        if (!fs.file_exists("raylib.so")):
+            throw "raylib.so not found in the current directory." from "FileNotFoundError"
+        end
+        lib = libload.load_lib("raylib.so")
+    end
+    "Darwin":
+        if (!fs.file_exists("raylib.dylib")):
+            throw "raylib.dylib not found in the current directory." from "FileNotFoundError"
+        end
+        lib = libload.load_lib("raylib.dylib")
+    end
+    _ ->
+        throw f"Unsupported OS: {os.os_name()}" from "UnsupportedOSError"
+    end
+end
+
+private final init_window_c: &int = libload.get_fn(lib, "init_window", [
+    "int", "int", "str"
+], "void")
+
+public final fun init_window(
+    width: int,
+    height: int,
+    title: str,
+) -> void:
+    /// Initializes a window and OpenGL context.
+    ///     @param width: int - The width of the window.
+    ///     @param height: int - The height of the window.
+    ///     @param title: str - The title of the window.
+    ///     @return: void - No return value.
+    if (init_window_c == null):
+        throw "Function 'init_window' not found in the loaded library." from "FunctionNotFoundError"
+    end
+    _title: &int = libload.create_str_ptr(title)
+    if (_title == null):
+        throw "Invalid pointer: null" from "PointerError"
+    end
+    libload.call_fn(init_window_c, [width, height, _title])
+    return null
+end
+
+
+// Function Aliases
+public final InitWindow = init_window

@@ -1538,11 +1538,7 @@ fn config(args: &[String]) {
 
             let lucia_path = Path::new(lucia_path_str);
             let lucia_real = lucia_path.canonicalize().unwrap_or_else(|_| lucia_path.to_path_buf());
-            match lucia_real
-                .parent()
-                .and_then(|p| p.parent())
-                .map(|p| p.join("config.json"))
-            {
+            match lucia_real.parent().and_then(|p| p.parent()).map(|p| p.join("config.json")) {
                 Some(path) => {
                     if !path.exists() {
                         eprintln!("{}", format!("Lucia config not found at {}", path.display()).red());
@@ -1565,27 +1561,24 @@ fn config(args: &[String]) {
             .ok()
             .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
             .and_then(|json| json.get("build_info")?.get("uuid")?.as_str().map(|s| s.to_string()));
-    
+
         fs::remove_file(&config_path).ok();
         fs::write(&config_path, "{}").ok();
-    
+
         match update_config_with_lucia_info(&config_path) {
             Ok(_) => {
                 let new_uuid = fs::read_to_string(&config_path)
                     .ok()
                     .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
                     .and_then(|json| json.get("build_info")?.get("uuid")?.as_str().map(|s| s.to_string()));
-    
+
                 println!("{}", format!("Successfully fetched config at {}", config_path.display()).green());
-    
+
                 match (old_uuid, new_uuid) {
                     (Some(old), Some(new)) if old != new => {
-                        println!(
-                            "{}",
-                            format!("Lucia UUID changed from '{}' to '{}'", old.bold(), new.bold()).blue()
-                        );
+                        println!("{}", format!("Lucia UUID changed from '{}' to '{}'", old.bold(), new.bold()).blue());
                     }
-                    (Some(old), Some(_new)) => {
+                    (Some(old), Some(_)) => {
                         println!("{}", format!("Lucia UUID remained '{}'", old.bold()).blue());
                     }
                     _ => {
@@ -1599,76 +1592,110 @@ fn config(args: &[String]) {
             }
         }
         return;
-    }    
+    }
 
-    if !set_pairs.is_empty() {
-        let mut config_json: serde_json::Map<String, JsonValue> = if config_path.exists() {
-            match fs::read_to_string(&config_path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-            {
-                Some(JsonValue::Object(map)) => map,
-                _ => {
-                    eprintln!("{}", "Failed to read or parse config file.".red());
-                    return;
-                }
-            }
-        } else {
-            serde_json::Map::new()
-        };
-
-        for (key, value) in set_pairs {
-            if config_json.contains_key(&key) && !no_confirm {
-                let confirm = Confirm::new()
-                    .with_prompt(format!("Key '{}' exists, overwrite?", key))
-                    .default(false)
-                    .interact()
-                    .unwrap_or(false);
-
-                if !confirm {
-                    println!("{}", "Aborted.".yellow());
-                    return;
-                }
-            }
-
-            let parsed_val = if let Some(num) = parse_bytes(&value) {
-                if num <= u64::MAX as u128 {
-                    JsonValue::Number(serde_json::Number::from(num as u64))
-                } else {
-                    JsonValue::String(value)
-                }
-            } else if let Ok(num) = value.parse::<i64>() {
-                JsonValue::Number(serde_json::Number::from(num))
-            } else {
-                JsonValue::String(value)
-            };
-
-            config_json.insert(key, parsed_val);
-        }
-
-        let json_str = match serde_json::to_string_pretty(&config_json) {
-            Ok(s) => s,
-            Err(_) => {
-                eprintln!("{}", "Failed to serialize config.".red());
+    let config_json: serde_json::Map<String, JsonValue> = if config_path.exists() {
+        match fs::read_to_string(&config_path).ok().and_then(|s| serde_json::from_str(&s).ok()) {
+            Some(JsonValue::Object(map)) => map,
+            _ => {
+                eprintln!("{}", "Failed to read or parse config file.".red());
                 return;
             }
-        };
+        }
+    } else {
+        serde_json::Map::new()
+    };
 
-        if let Err(e) = fs::write(&config_path, json_str) {
-            eprintln!("{}", format!("Failed to write config: {}", e).red());
-        } else {
-            println!("{}", format!("Config updated at {}", config_path.display()).green());
+    let mut key_order: Vec<String> = config_json.keys().cloned().collect();
+
+    for (key_path, value) in set_pairs {
+        if config_json.contains_key(&key_path) && !no_confirm {
+            let confirm = Confirm::new()
+                .with_prompt(format!("Key '{}' exists, overwrite?", key_path))
+                .default(false)
+                .interact()
+                .unwrap_or(false);
+            if !confirm {
+                println!("{}", "Aborted.".yellow());
+                return;
+            }
         }
 
-    } else if let Some(key) = get_key {
-        let config_json: JsonValue = fs::read_to_string(&config_path)
-            .ok()
-            .and_then(|data| serde_json::from_str(&data).ok())
-            .unwrap_or_else(|| json!({}));
+        let parsed_val = if let Some(num) = parse_bytes(&value) {
+            if num <= u64::MAX as u128 {
+                JsonValue::Number(serde_json::Number::from(num as u64))
+            } else {
+                JsonValue::String(value.clone())
+            }
+        } else if let Ok(num) = value.parse::<i64>() {
+            JsonValue::Number(serde_json::Number::from(num))
+        } else {
+            JsonValue::String(value.clone())
+        };
 
-        match config_json.get(&key) {
-            Some(val) => println!("{} ({})", val, json_type(val)),
-            None => eprintln!("{}", format!("Key '{}' not found in config.", key).yellow()),
+        let parts: Vec<&str> = key_path.split('.').collect();
+        let last = parts.last().unwrap();
+        let mut cur = &mut JsonValue::Object(config_json.clone());
+
+        for part in &parts[..parts.len() - 1] {
+            cur = match cur {
+                JsonValue::Object(map) => map.entry(*part).or_insert(json!({})),
+                JsonValue::Array(arr) => {
+                    let idx = part.parse::<usize>().unwrap_or_else(|_| { eprintln!("Invalid index {}", part); exit(1); });
+                    while arr.len() <= idx {
+                        arr.push(json!({}));
+                    }
+                    &mut arr[idx]
+                }
+                _ => { eprintln!("Cannot traverse non-object/array for '{}'", part); return; }
+            };
+        }
+
+        match cur {
+            JsonValue::Object(map) => {
+                map.insert(last.to_string(), parsed_val);
+            }
+            JsonValue::Array(arr) => {
+                let idx = last.parse::<usize>().unwrap_or_else(|_| { eprintln!("Invalid index {}", last); exit(1); });
+                while arr.len() <= idx {
+                    arr.push(JsonValue::Null);
+                }
+                arr[idx] = parsed_val;
+            }
+            _ => { eprintln!("Cannot set value on non-object/array at '{}'", last); return; }
+        }
+
+        if !key_order.contains(&parts[0].to_string()) {
+            key_order.push(parts[0].to_string());
+        }
+    }
+
+    let mut ordered_json = serde_json::Map::new();
+    for k in key_order {
+        if let Some(v) = config_json.get(&k) {
+            ordered_json.insert(k, v.clone());
+        }
+    }
+
+    if let Err(e) = fs::write(&config_path, serde_json::to_string_pretty(&ordered_json).unwrap_or_else(|_| "{}".to_string())) {
+        eprintln!("{}", format!("Failed to write config: {}", e).red());
+    } else {
+        println!("{}", format!("Config updated at {}", config_path.display()).green());
+    }
+
+    if let Some(key_path) = get_key {
+        let mut cur: &JsonValue = &JsonValue::Object(config_json.clone());
+        for part in key_path.split('.') {
+            cur = match cur {
+                JsonValue::Object(map) => map.get(part).unwrap_or(&JsonValue::Null),
+                JsonValue::Array(arr) => arr.get(part.parse::<usize>().unwrap_or(usize::MAX)).unwrap_or(&JsonValue::Null),
+                _ => &JsonValue::Null,
+            };
+        }
+        if cur.is_null() {
+            eprintln!("{}", format!("Key '{}' not found in config.", key_path).yellow());
+        } else {
+            println!("{} ({})", cur, json_type(cur));
         }
     }
 }
