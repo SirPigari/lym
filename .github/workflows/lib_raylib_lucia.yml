@@ -9,6 +9,7 @@ on:
 jobs:
   build:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 0
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
@@ -77,6 +78,7 @@ jobs:
 
   bundle:
     needs: build
+    timeout-minutes: 0
     runs-on: ubuntu-latest
 
     steps:
