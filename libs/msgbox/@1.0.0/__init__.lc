@@ -1,0 +1,166 @@
+import libload
+import os
+import fs
+
+// Simple message box library for displaying message boxes with various styles and icons.
+// This library supports Windows, Linux, and macOS platforms.
+
+private mutable lib: ?&int = null
+
+fs.change_dir(__dir__)
+match (os.os_name()):
+    "Windows":
+        if (!fs.file_exists("msgbox.dll")):
+            throw "msgbox.dll not found in the current directory." from "FileNotFoundError"
+        end
+        lib = libload.load_lib("msgbox.dll")
+    end
+    "Linux":
+        if (!fs.file_exists("msgbox.so")):
+            throw "msgbox.so not found in the current directory." from "FileNotFoundError"
+        end
+        lib = libload.load_lib("msgbox.so")
+    end
+    "Darwin":
+        if (!fs.file_exists("msgbox.dylib")):
+            throw "msgbox.dylib not found in the current directory." from "FileNotFoundError"
+        end
+        lib = libload.load_lib("msgbox.dylib")
+    end
+    _ ->
+        throw f"Unsupported OS: {os.os_name()}" from "UnsupportedOSError"
+    end
+end
+
+// MSGBOX style flags
+public final MSGBOX_OK: int                 = 0x0000
+public final MSGBOX_OKCANCEL: int           = 0x0001
+public final MSGBOX_ABORTRETRYIGNORE: int   = 0x0002
+public final MSGBOX_YESNOCANCEL: int        = 0x0003
+public final MSGBOX_YESNO: int              = 0x0004
+public final MSGBOX_RETRYCANCEL: int        = 0x0005
+public final MSGBOX_CANCELTRYCONTINUE: int  = 0x0006
+
+public final MSGBOX_ICONHAND: int           = 0x0010
+public final MSGBOX_ICONQUESTION: int       = 0x0020
+public final MSGBOX_ICONEXCLAMATION: int    = 0x0030
+public final MSGBOX_ICONASTERISK: int       = 0x0040
+
+public final MSGBOX_USERICON: int           = 0x0080
+public final MSGBOX_ICONWARNING: int        = MSGBOX_ICONEXCLAMATION
+public final MSGBOX_ICONERROR: int          = MSGBOX_ICONHAND
+public final MSGBOX_ICONINFORMATION: int    = MSGBOX_ICONASTERISK
+public final MSGBOX_ICONSTOP: int           = MSGBOX_ICONHAND
+
+public final MSGBOX_DEFBUTTON1: int         = 0x0000
+public final MSGBOX_DEFBUTTON2: int         = 0x0100
+public final MSGBOX_DEFBUTTON3: int         = 0x0200
+public final MSGBOX_DEFBUTTON4: int         = 0x0300
+
+public final MSGBOX_APPLMODAL: int          = 0x0000
+public final MSGBOX_SYSTEMMODAL: int        = 0x1000
+public final MSGBOX_TASKMODAL: int          = 0x2000
+
+public final MSGBOX_HELP: int               = 0x4000
+public final MSGBOX_NOFOCUS: int            = 0x8000
+public final MSGBOX_SETFOREGROUND: int      = 0x10000
+public final MSGBOX_DEFAULTDESKTOPONLY: int = 0x20000
+public final MSGBOX_TOPMOST: int            = 0x40000
+public final MSGBOX_RIGHT: int              = 0x80000
+public final MSGBOX_RTLREADING: int         = 0x100000
+
+public final MSGBOX_TYPEMASK: int           = 0x000F
+public final MSGBOX_ICONMASK: int           = 0x00F0
+
+// Return constants aligned with Windows IDOK
+public final MSGBOX_RET_OK: int             = 1
+public final MSGBOX_RET_CANCEL: int         = 2
+public final MSGBOX_RET_ABORT: int          = 3
+public final MSGBOX_RET_RETRY: int          = 4
+public final MSGBOX_RET_IGNORE: int         = 5
+public final MSGBOX_RET_YES: int            = 6
+public final MSGBOX_RET_NO: int             = 7
+public final MSGBOX_RET_CLOSE: int          = 8
+public final MSGBOX_RET_HELP: int           = 9
+public final MSGBOX_RET_TRYAGAIN: int       = 10
+public final MSGBOX_RET_CONTINUE: int       = 11
+
+private final show_message_box_c: &int = libload.get_fn(lib, "show_message_box", [
+    "str", "str", "int"
+], "int")
+
+public final fun show_message_box(
+    title: str,
+    message: str,
+    flags: int = MSGBOX_OK
+) -> int:
+    // Displays a message box with the specified title and message.
+    
+    // Parameters:
+    //     title (str): The title of the message box.
+    //     message (str): The message to display in the box.
+    //     flags (int): Flags to customize the message box appearance and buttons.
+    
+    // Returns:
+    //     int: The button pressed by the user.
+    if (show_message_box_c == null):
+        throw "Function 'show_message_box' not found in the loaded library." from "FunctionNotFoundError"
+    end
+    (_title: &int, _message: &int) = (libload.create_str_ptr(title), libload.create_str_ptr(message))
+    if (_title == null || _message == null):
+        throw "Invalid pointer: null" from "PointerError"
+    end
+    return libload.call_fn(show_message_box_c, [_title, _message, flags])
+end
+
+public final fun msgbox_err(title: str, message: str) -> int:
+    // Displays an error message box with the specified title and message.
+    // This message box will have an error icon and an OK button.
+    //
+    // Parameters:
+    //     title (str): The title of the message box.
+    //     message (str): The message to display in the box.
+    //
+    // Returns:
+    //     int: The button pressed by the user.
+    return show_message_box(title, message, MSGBOX_OK bor MSGBOX_ICONERROR)
+end
+
+public final fun msgbox_info(title: str, message: str) -> int:
+    // Displays an informational message box with the specified title and message.
+    // This message box will have an information icon and an OK button.
+    //
+    // Parameters:
+    //     title (str): The title of the message box.
+    //     message (str): The message to display in the box.
+    //
+    // Returns:
+    //     int: The button pressed by the user.
+    return show_message_box(title, message, MSGBOX_OK bor MSGBOX_ICONINFORMATION)
+end
+
+public final fun msgbox_warn(title: str, message: str) -> int:
+    // Displays a warning message box with the specified title and message.
+    // This message box will have a warning icon and an OK button.
+    //
+    // Parameters:
+    //     title (str): The title of the message box.
+    //     message (str): The message to display in the box.
+    //
+    // Returns:
+    //     int: The button pressed by the user.
+    return show_message_box(title, message, MSGBOX_OK bor MSGBOX_ICONWARNING)
+end
+
+public final fun msgbox_ask(title: str, message: str) -> int:
+    // Displays a question message box with the specified title and message.
+    // This message box will have a question icon and Yes/No buttons.
+    //
+    // Parameters:
+    //     title (str): The title of the message box.
+    //     message (str): The message to display in the box.
+    //
+    // Returns:
+    //     int: The button pressed by the user.
+    return show_message_box(title, message, MSGBOX_YESNO bor MSGBOX_ICONQUESTION)
+end
