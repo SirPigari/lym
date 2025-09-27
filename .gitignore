@@ -4,5 +4,5 @@ Cargo.lock
 .vscode/
 /bin/
 
-# lumina - in development
-libs/lumina/
+# old library folder
+libs/

@@ -10,13 +10,18 @@ use std::time::Duration;
 use serde_json::{Value as JsonValue, json};
 use getch_rs::{Getch, Key};
 use reqwest::blocking::Client;
+use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT, AUTHORIZATION};
 use base64::{engine::general_purpose, Engine as _};
+use std::io::{stdout, stdin, Write};
+use serde_json::Value;
+use std::cmp::Ordering;
+use std::collections::HashMap;
 
 mod db;
 mod utils;
 
 use db::{STD_LIBS, load_std_libs};
-use utils::{check_version, parse_bytes, json_type};
+use utils::{check_version, parse_bytes, json_type, is_next_version, find_closest_match, cmp_version};
 
 // lym - Lucia package manager
 // 'lym' isnt an acronym if you were wondering
@@ -42,6 +47,11 @@ fn ensure_lym_dirs() -> io::Result<()> {
     let config_path = lym_dir.join("config.json");
     if !config_path.exists() {
         update_config_with_lucia_info(&config_path)?;
+    }
+
+    let lym_auth_path = lym_dir.join("lym_auth.json");
+    if !lym_auth_path.exists() {
+        fs::write(&lym_auth_path, "{}")?;
     }
 
     let logs_dir = lym_dir.join("logs");
@@ -110,7 +120,7 @@ fn update_config_with_lucia_info(config_path: &Path) -> io::Result<()> {
 
     let original_repo_url = build_info.get("repository")
         .and_then(JsonValue::as_str)
-        .unwrap_or("https://github.com/SirPigari/lym");
+        .unwrap_or("https://github.com/SirPigari/lym-libs");
 
     let (repo_slug, final_repo_url) = {
         let url = original_repo_url.trim_end_matches('/');
@@ -119,24 +129,34 @@ fn update_config_with_lucia_info(config_path: &Path) -> io::Result<()> {
             let parts: Vec<&str> = user_and_repo.split('/').collect();
             if parts.len() >= 1 {
                 let user = parts[0];
-                let slug = format!("{}/lym", user);
+                let slug = format!("{}/lym-libs", user);
                 let full_url = format!("https://github.com/{}", slug);
 
+                let mut headers = HeaderMap::new();
+                headers.insert(USER_AGENT, HeaderValue::from_static("lym-checker"));
+
+                if let Some((username, token)) = get_lym_auth() {
+                    let auth_val = general_purpose::STANDARD.encode(format!("{}:{}", username, token));
+                    let auth_header = format!("Basic {}", auth_val);
+                    headers.insert(AUTHORIZATION, HeaderValue::from_str(&auth_header).unwrap());
+                }
+
                 let client = Client::builder()
-                    .timeout(Duration::from_secs(3))
+                    .default_headers(headers)
+                    .timeout(Duration::from_secs(30))
                     .build()
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to build reqwest client: {}", e)))?;
 
                 if github_repo_exists(&client, &slug) {
                     (slug, full_url)
                 } else {
-                    ("SirPigari/lym".to_string(), "https://github.com/SirPigari/lym".to_string())
+                    ("SirPigari/lym-libs".to_string(), "https://github.com/SirPigari/lym-libs".to_string())
                 }
             } else {
-                ("SirPigari/lym".to_string(), "https://github.com/SirPigari/lym".to_string())
+                ("SirPigari/lym-libs".to_string(), "https://github.com/SirPigari/lym-libs".to_string())
             }
         } else {
-            ("SirPigari/lym".to_string(), "https://github.com/SirPigari/lym".to_string())
+            ("SirPigari/lym-libs".to_string(), "https://github.com/SirPigari/lym-libs".to_string())
         }
     };
 
@@ -158,9 +178,56 @@ fn update_config_with_lucia_info(config_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn update_lym_auth(username: &str, token: &str) -> io::Result<()> {
+    let lym_dir = get_lym_dir()?;
+    let lym_auth_path = lym_dir.join("lym_auth.json");
+
+    let mut auth_json: JsonValue = if lym_auth_path.exists() {
+        let data = fs::read_to_string(&lym_auth_path)?;
+        serde_json::from_str(&data).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+
+    auth_json["username"] = json!(username);
+    auth_json["token"] = json!(token);
+
+    let serialized = serde_json::to_string_pretty(&auth_json)?;
+    fs::write(lym_auth_path, serialized)?;
+
+    Ok(())
+}
+
+fn get_lym_auth() -> Option<(String, String)> {
+    let lym_dir = get_lym_dir().ok()?;
+    let auth_path = lym_dir.join("lym_auth.json");
+    let data = fs::read_to_string(auth_path).ok()?;
+    let json: Value = serde_json::from_str(&data).ok()?;
+    let username = json.get("username")?.as_str()?.to_string();
+    let token = json.get("token")?.as_str()?.to_string();
+    Some((username, token))
+}
+
+fn collect_files(base: &Path, current: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(current).unwrap_or_else(|_| {
+        eprintln!("{}", "Failed to read directory contents".red());
+        exit(1);
+    }) {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        if path.is_file() {
+            files.push(path.strip_prefix(base).unwrap().to_path_buf());
+        } else if path.is_dir() {
+            files.extend(collect_files(base, &path));
+        }
+    }
+    files
+}
+
 fn print_help() {
     println!(
-        "{} - {}\n\n{}:\n  {} <command> [args]\n\n{}:\n  {}   Install a package\n  {}      List installed packages\n  {}  Download a package\n  {}    Remove a package\n  {}   Disable a package\n  {}    Enable a package\n  {}    Set configuration options (lucia or lym)\n  {}    Modify package manifest\n  {}       Create a new package\n\n{} 'lym <command> --help' {} for more info on a command.\n",
+        "{} - {}\n\n{}:\n  {} <command> [args]\n\n{}:\n  {}   Install a package\n  {}      List installed packages\n  {}  Download a package\n  {}    Remove a package\n  {}   Disable a package\n  {}    Enable a package\n  {}    Set configuration options (lucia or lym)\n  {}    Modify package manifest\n  {}   Publish a package\n  {}     Login a user\n  {}       Create a new package\n\n{} 'lym <command> --help' {} for more info on a command.\n",
         "lym".bright_blue().bold(),
         "Lucia package manager".bright_white(),
         "Usage".bright_green().bold(),
@@ -174,6 +241,8 @@ fn print_help() {
         "enable".bright_cyan(),
         "config".bright_cyan(),
         "modify".bright_cyan(),
+        "publish".bright_cyan(),
+        "login".bright_cyan(),
         "new".bright_cyan(),
         "Use".bright_green(),
         "'lym <command> --help'".bright_yellow()
@@ -188,7 +257,7 @@ fn command_help(cmd: &str) {
                 "Usage:".bright_green().bold(),
                 "lym".bright_cyan().bold(),
                 "list".bright_cyan(),
-                "[--remote | --local | --store] [--no-desc] [--no-ver] [--no-std] [--help]".bright_yellow(),
+                "[--remote | --local | --store] [--no-desc] [--no-ver] [--no-std] [--help] [package_name]".bright_yellow(),
                 "Lists installed packages or remote packages.".bright_white()
             );
         }
@@ -270,6 +339,26 @@ fn command_help(cmd: &str) {
                 "new".bright_cyan(),
                 "[package | module] [name] [path] [--no-confirm] [--help] [--main-file:<name>]".bright_yellow(),
                 "Creates a new package/module with a basic manifest.json.".bright_white()
+            );
+        }
+        "publish" => {
+            println!(
+                "{} {} {} {}\n\n{}",
+                "Usage:".bright_green().bold(),
+                "lym".bright_cyan().bold(),
+                "publish".bright_cyan(),
+                "[path] [--no-confirm] [-v] [--help]".bright_yellow(),
+                "Publishes a package to the remote repository.".bright_white()
+            );
+        }
+        "login" => {
+            println!(
+                "{} {} {} {}\n\n{}",
+                "Usage:".bright_green().bold(),
+                "lym".bright_cyan().bold(),
+                "login".bright_cyan(),
+                "[--help]".bright_yellow(),
+                "Logs in a user by storing their GitHub username and Personal Access Token.".bright_white()
             );
         }
         _ => {
@@ -371,10 +460,23 @@ pub fn check_and_close_lucia(no_confirm: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Result<(), String> {
-    match check_and_close_lucia(no_confirm) {
-        Ok(_) => {}
-        Err(e) => return Err(e),
+fn install_single_package(
+    pkg_name: &str,
+    no_confirm: bool,
+    verbose: bool,
+    output_path: Option<&Path>,
+) -> Result<(), String> {
+    check_and_close_lucia(no_confirm)?;
+
+    if !no_confirm {
+        let result = Confirm::new()
+            .with_prompt(format!("Install package '{}'?", pkg_name))
+            .default(true)
+            .interact()
+            .map_err(|e| format!("Failed to read user input: {}", e))?;
+        if !result {
+            return Err("Installation cancelled by user.".to_string());
+        }
     }
 
     let lym_dir = get_lym_dir().map_err(|e| format!("Failed to get lym dir: {}", e))?;
@@ -383,13 +485,13 @@ fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Re
         .map_err(|e| format!("Failed to read config.json: {}", e))
         .and_then(|data| serde_json::from_str(&data).map_err(|e| format!("Invalid config.json: {}", e)))?;
 
-    let lucia_path_str = config_json.get("lucia_path")
-        .and_then(JsonValue::as_str)
-        .ok_or("Lucia path not set in config. Run lym config or reinstall lucia.")?;
-    let lucia_path = Path::new(lucia_path_str);
+    let lucia_path = Path::new(
+        config_json.get("lucia_path")
+            .and_then(JsonValue::as_str)
+            .ok_or("Lucia path not set in config. Run lym config or reinstall lucia.")?
+    );
     let lucia_real = lucia_path.canonicalize().unwrap_or_else(|_| lucia_path.to_path_buf());
-    let libs_dir = lucia_real
-        .parent()
+    let libs_dir = lucia_real.parent()
         .and_then(|p| p.parent())
         .unwrap_or(&lucia_real)
         .join("libs");
@@ -405,46 +507,148 @@ fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Re
         .and_then(JsonValue::as_str)
         .ok_or("Repository slug not set in config.")?;
 
-    let local_pkg_path = libs_dir.join(pkg_name);
-    let already_installed = local_pkg_path.exists();
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static("lym-install"));
 
-    if already_installed && !no_confirm {
-        let override_confirm = Confirm::new()
-            .with_prompt(format!("Package '{}' is already installed. Override? (Y/n)", pkg_name))
-            .default(false)
-            .interact()
-            .map_err(|e| format!("Prompt error: {}", e))?;
-
-        if !override_confirm {
-            if verbose {
-                println!("{}", "Install cancelled by user.".yellow());
-            }
-            return Ok(());
-        }
+    if let Some((username, token)) = get_lym_auth() {
+        let auth_val = general_purpose::STANDARD.encode(format!("{}:{}", username, token));
+        let auth_header = format!("Basic {}", auth_val);
+        headers.insert(AUTHORIZATION, HeaderValue::from_str(&auth_header).unwrap());
     }
 
-    let fetch_pb = ProgressBar::new_spinner();
-    fetch_pb.set_message("Fetching manifest.json...");
-    fetch_pb.enable_steady_tick(Duration::from_millis(100));
-
-    let manifest_url = format!("https://api.github.com/repos/{}/contents/libs/{}/manifest.json", repo_slug, pkg_name);
     let client = Client::builder()
+        .default_headers(headers)
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-    let resp = client.get(&manifest_url)
-        .header("User-Agent", "lym-install")
+    let versions_url = format!("https://api.github.com/repos/{}/contents/{}", repo_slug, pkg_name);
+    let resp = client.get(&versions_url)
         .send()
-        .map_err(|e| format!("Failed to send request: {}", e))?;
+        .map_err(|e| format!("Failed to fetch package versions: {}", e))?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        let root_url = format!("https://api.github.com/repos/{}/contents/", repo_slug);
+        let all_packages: Vec<String> = client.get(&root_url)
+            .send().ok()
+            .and_then(|r| r.json::<Vec<JsonValue>>().ok())
+            .map(|items| items.iter()
+                .filter_map(|item| item.get("name").and_then(JsonValue::as_str).map(|s| s.to_string()))
+                .collect())
+            .unwrap_or_default();
+
+        if let Some(s) = find_closest_match(pkg_name, &all_packages) {
+            return Err(format!("Package '{}' not found. Did you mean '{}'?", pkg_name, s));
+        } else {
+            return Err(format!("Package '{}' not found.", pkg_name));
+        }
+    }
+
+    let resp_val: JsonValue = resp.json::<JsonValue>()
+        .map_err(|e| format!("Failed to parse remote versions: {}", e))?;
+
+    let remote_items: Vec<JsonValue> = match resp_val {
+        JsonValue::Array(arr) => arr,
+        JsonValue::Object(obj) => {
+            if let Some(msg) = obj.get("message") {
+                return Err(format!("Failed to fetch package '{}': {}", pkg_name, msg));
+            } else {
+                return Err(format!("Unexpected response when fetching package '{}'", pkg_name));
+            }
+        },
+        _ => return Err(format!("Unexpected response type when fetching package '{}'", pkg_name)),
+    };
+
+    let mut version_dirs: Vec<String> = remote_items.iter()
+        .filter_map(|item| {
+            let name = item.get("name")?.as_str()?;
+            if name.starts_with('@') { Some(name[1..].to_string()) } else { None }
+        })
+        .collect();
+
+    if version_dirs.is_empty() {
+        return Err(format!("No versions found for package '{}'", pkg_name));
+    }
+
+    version_dirs.sort_by(|a, b| cmp_version(a, b).unwrap_or(Ordering::Equal));
+    let latest_version = version_dirs.last().unwrap().clone();
+    let chosen_version = latest_version.clone();
+    if verbose {
+        println!("{}", format!("Installing '{}' version '{}'", pkg_name, chosen_version).bright_cyan());
+    }
+
+    let local_pkg_path = output_path
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| libs_dir.join(pkg_name));
+
+    let mut installed_version: Option<String> = None;
+    if local_pkg_path.exists() {
+        let manifest_file = local_pkg_path.join("manifest.json");
+        if manifest_file.exists() {
+            if let Ok(data) = fs::read_to_string(&manifest_file) {
+                if let Ok(manifest_json) = serde_json::from_str::<JsonValue>(&data) {
+                    if let Some(ver) = manifest_json.get("version").and_then(JsonValue::as_str) {
+                        installed_version = Some(ver.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(inst_ver) = installed_version.clone() {
+        if cmp_version(&chosen_version, &inst_ver) == Some(Ordering::Greater) {
+            println!("{}", format!("Upgrading '{}' from version '{}' -> '{}'", pkg_name, inst_ver, chosen_version).bright_blue());
+        } else if cmp_version(&chosen_version, &inst_ver) == Some(Ordering::Less) {
+            if !no_confirm {
+                print!("Installed version '{}' is newer than '{}'. Downgrade? ([Y]/n) ", inst_ver, chosen_version);
+                stdout().flush().unwrap();
+                let g = Getch::new();
+                let c = match g.getch() {
+                    Ok(Key::Char(c)) => c.to_ascii_lowercase(),
+                    Ok(Key::Esc) => 'n',
+                    _ => 'n',
+                };
+                println!();
+                if c != 'y' { return Ok(()); }
+            }
+            println!("{}", format!("Downgrading '{}' from version '{}' -> '{}'", pkg_name, inst_ver, chosen_version).bright_yellow());
+        } else {
+            if !no_confirm {
+                let download = Confirm::new()
+                    .with_prompt(format!("Package '{}' is already at version '{}'. Install anyway?", pkg_name, chosen_version))
+                    .default(true)
+                    .interact()
+                    .map_err(|e| format!("Failed to read user input: {}", e))?;
+                if !download {
+                    println!("{}", format!("Skipping '{}'", pkg_name).bright_green());
+                    return Ok(());
+                }
+            } else {
+                println!("{}", format!("Package '{}' already at version '{}', proceeding with download due to no_confirm", pkg_name, chosen_version).bright_yellow());
+            }
+        }
+        fs::remove_dir_all(&local_pkg_path)
+            .map_err(|e| format!("Failed to remove existing package directory: {}", e))?;
+    }
+
+    fs::create_dir_all(&local_pkg_path)
+        .map_err(|e| format!("Failed to create package directory: {}", e))?;
+
+    let manifest_url = format!(
+        "https://api.github.com/repos/{}/contents/{}/@{}/manifest.json",
+        repo_slug, pkg_name, chosen_version
+    );
+    let fetch_pb = ProgressBar::new_spinner();
+    fetch_pb.set_message("Fetching manifest.json...");
+    fetch_pb.enable_steady_tick(Duration::from_millis(100));
+
+    let resp = client.get(&manifest_url)
+        .send()
+        .map_err(|e| format!("Failed to fetch manifest.json: {}", e))?;
 
     fetch_pb.finish_and_clear();
-
     if !resp.status().is_success() {
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(format!("Package '{}' not found in the remote repository. Please check the package name and try again.", pkg_name));
-        }
-        return Err(format!("Failed to get manifest.json: HTTP {}", resp.status()));
+        return Err(format!("Failed to fetch manifest.json: HTTP {}", resp.status()));
     }
 
     let manifest_json: JsonValue = resp.json()
@@ -452,13 +656,13 @@ fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Re
 
     let encoded_content = manifest_json.get("content")
         .and_then(JsonValue::as_str)
-        .ok_or("manifest.json content missing in remote response.")?
+        .ok_or("manifest.json content missing in remote response")?
         .replace('\n', "");
 
     let decoded_bytes = general_purpose::STANDARD.decode(&encoded_content)
         .map_err(|e| format!("Failed to decode manifest.json content: {}", e))?;
 
-    let manifest_str = String::from_utf8(decoded_bytes)
+    let manifest_str = String::from_utf8(decoded_bytes.clone())
         .map_err(|e| format!("manifest.json is not valid UTF-8: {}", e))?;
 
     let manifest: JsonValue = serde_json::from_str(&manifest_str)
@@ -474,11 +678,15 @@ fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Re
         .unwrap_or("0.0.0");
 
     if verbose {
-        println!("{}", format!("Checking lucia version: required '{}' vs current '{}'", required_version.to_string().bright_green(), current_version.to_string().bright_green()));
+        println!("{}", format!("Checking lucia version: required '{}' vs current '{}'",
+            required_version.bright_green(), current_version.bright_green()));
     }
 
     if !check_version(current_version, required_version) {
-        eprintln!("{}", format!("Warning: Package '{}' requires lucia version '{}', but current version is '{}'", pkg_name, required_version, current_version).yellow());
+        eprintln!("{}", format!(
+            "Warning: Package '{}' requires lucia version '{}', but current version is '{}'",
+            pkg_name, required_version, current_version
+        ).yellow());
 
         if !no_confirm {
             let cont = Confirm::new()
@@ -488,46 +696,180 @@ fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Re
                 .map_err(|e| format!("Prompt error: {}", e))?;
 
             if !cont {
-                if verbose {
-                    println!("{}", "Install cancelled due to version mismatch.".yellow());
-                }
+                if verbose { println!("{}", "Install cancelled due to version mismatch.".yellow()); }
                 return Ok(());
             }
         }
     }
 
-    let api_url = format!("https://api.github.com/repos/{}/contents/libs/{}", repo_slug, pkg_name);
-    let resp = client.get(&api_url)
-        .header("User-Agent", "lym-install")
-        .send()
-        .map_err(|e| format!("Failed to send request: {}", e))?;
+    if let Some(deps) = manifest.get("dependencies").and_then(JsonValue::as_object) {
+        let deps = deps.iter().filter(|(name, _)| !STD_LIBS.contains_key(name.as_str())).collect::<Vec<(&String, &JsonValue)>>();
+        if !deps.is_empty() {
+            println!("{}", "Dependencies found:".bright_yellow());
+            for (dep_name, dep_version_val) in &deps {
+                let dep_version = dep_version_val.as_str().unwrap_or("*");
+                println!("  {}@{}", dep_name, dep_version);
+            }
 
-    if !resp.status().is_success() {
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(format!("Package '{}' not found in the remote repository. Please check the package name and try again.", pkg_name));
+            let g = Getch::new();
+            let mut install_all = false;
+            let mut install_each = false;
+
+            loop {
+                print!("Install dependencies? ([Y]es/[A]ll/[N]one) ");
+                stdout().flush().unwrap();
+
+                let choice = match g.getch() {
+                    Ok(Key::Char(c)) => c.to_ascii_lowercase(),
+                    Ok(Key::Esc) => 'n',
+                    _ => continue,
+                };
+                println!();
+
+                match choice {
+                    'y' => { install_each = true; break; },
+                    'a' => { install_all = true; break; },
+                    'n' => break,
+                    _ => { println!("Please press Y, A, or N."); continue; }
+                }
+            }
+
+            if install_each || install_all {
+                for (dep_name, dep_version_val) in deps {
+                    let dep_version = dep_version_val.as_str().unwrap_or("*");
+                    let dep_path = libs_dir.join(dep_name);
+                    let mut dep_installed_version: Option<String> = None;
+                    if dep_path.exists() {
+                        let dep_manifest = dep_path.join("manifest.json");
+                        if dep_manifest.exists() {
+                            if let Ok(data) = fs::read_to_string(&dep_manifest) {
+                                if let Ok(json) = serde_json::from_str::<JsonValue>(&data) {
+                                    dep_installed_version = json.get("version").and_then(JsonValue::as_str).map(|s| s.to_string());
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(inst_ver) = dep_installed_version.clone() {
+                        if inst_ver == dep_version {
+                            if verbose { println!("Dependency '{}' already at version '{}', skipping", dep_name, inst_ver); }
+                            continue;
+                        }
+                        if cmp_version(&dep_version, &inst_ver) == Some(Ordering::Greater) {
+                            println!("{}", format!("Upgrading dependency '{}' from '{}' -> '{}'", dep_name, inst_ver, dep_version).bright_blue());
+                        } else if cmp_version(&dep_version, &inst_ver) == Some(Ordering::Less) {
+                            if !no_confirm {
+                                print!("Installed version '{}' of '{}' is newer than '{}'. Downgrade? ([Y]/n) ", inst_ver, dep_name, dep_version);
+                                stdout().flush().unwrap();
+                                let c = match g.getch() {
+                                    Ok(Key::Char(c)) => c.to_ascii_lowercase(),
+                                    Ok(Key::Esc) => 'n',
+                                    _ => 'n',
+                                };
+                                println!();
+                                if c != 'y' { continue; }
+                            }
+                            println!("{}", format!("Downgrading dependency '{}' from '{}' -> '{}'", dep_name, inst_ver, dep_version).bright_yellow());
+                        } else {
+                            if !no_confirm {
+                                let download = Confirm::new()
+                                    .with_prompt(format!("Dependency '{}' is already at version '{}'. Install anyway?", dep_name, inst_ver))
+                                    .default(true)
+                                    .interact()
+                                    .map_err(|e| format!("Failed to read user input: {}", e))?;
+                                if !download {
+                                    println!("{}", format!("Skipping '{}'", dep_name).bright_green());
+                                    continue;
+                                }
+                            } else {
+                                println!("{}", format!("Dependency '{}' already at version '{}', proceeding with download due to no_confirm", dep_name, inst_ver).bright_yellow());
+                            }
+                        }
+                        fs::remove_dir_all(&dep_path).ok();
+                    }
+
+                    install_single_package(dep_name, no_confirm, verbose, None)?;
+                }
+            }
         }
-        return Err(format!("Failed to get remote package contents: HTTP {}", resp.status()));
     }
 
-    let contents = resp.json::<Vec<JsonValue>>()
-        .map_err(|e| format!("Failed to parse remote package directory listing: {}", e))?;
+    fn download_dir_recursive(
+        client: &Client,
+        repo_slug: &str,
+        remote_path: &str,
+        local_path: &Path,
+        verbose: bool,
+        pb: &ProgressBar,
+    ) -> Result<(), String> {
+        let contents: Vec<JsonValue> = client.get(&format!("https://api.github.com/repos/{}/contents/{}", repo_slug, remote_path))
+            .send()
+            .map_err(|e| format!("Failed to fetch '{}': {}", remote_path, e))?
+            .json()
+            .map_err(|e| format!("Failed to parse JSON for '{}': {}", remote_path, e))?;
 
-    if verbose {
-        println!("{}", format!("Found {} files/directories to download", contents.len()));
+        for item in contents {
+            let name = item.get("name").and_then(JsonValue::as_str).ok_or("Missing name")?;
+            let item_type = item.get("type").and_then(JsonValue::as_str).unwrap_or("");
+            let local_item_path = local_path.join(name);
+
+            if item_type == "file" {
+                let download_url = item.get("download_url").and_then(JsonValue::as_str)
+                    .ok_or_else(|| format!("File '{}' missing download_url", name))?;
+                if verbose { pb.set_message(format!("Downloading {}", name)); }
+
+                let mut resp = client.get(download_url)
+                    .send()
+                    .map_err(|e| format!("Failed to download '{}': {}", name, e))?;
+
+                if !resp.status().is_success() {
+                    eprintln!("{}", format!("Failed to download file {}: HTTP {}", name, resp.status()).red());
+                    continue;
+                }
+
+                let mut file = std::fs::File::create(&local_item_path)
+                    .map_err(|e| format!("Failed to create '{}': {}", local_item_path.display(), e))?;
+                resp.copy_to(&mut file).map_err(|e| format!("Failed to write '{}': {}", local_item_path.display(), e))?;
+            } else if item_type == "dir" {
+                std::fs::create_dir_all(&local_item_path)
+                    .map_err(|e| format!("Failed to create directory '{}': {}", local_item_path.display(), e))?;
+                download_dir_recursive(client, repo_slug, &format!("{}/{}", remote_path, name), &local_item_path, verbose, pb)?;
+            }
+            pb.inc(1);
+        }
+
+        Ok(())
     }
 
-    if local_pkg_path.exists() {
-        let del_pb = ProgressBar::new_spinner();
-        del_pb.set_message(format!("Removing existing package directory {}", local_pkg_path.display()));
-        del_pb.enable_steady_tick(Duration::from_millis(100));
+    let api_url = format!("{}/@{}", pkg_name, chosen_version);
+    // let resp = client.get(&format!("https://api.github.com/repos/{}/contents/{}", repo_slug, api_url))
+    //     .send()
+    //     .map_err(|e| format!("Failed to fetch package files: {}", e))?
+    //     .json::<Vec<JsonValue>>()
+    //     .map_err(|e| format!("Failed to parse remote package directory listing: {}", e))?;
 
-        fs::remove_dir_all(&local_pkg_path).map_err(|e| format!("Failed to remove existing package directory: {}", e))?;
+    let mut total_files = 0;
+    let mut stack = vec![format!("{}/@{}", pkg_name, chosen_version)];
 
-        del_pb.finish_with_message("Existing package directory removed");
+    while let Some(remote_path) = stack.pop() {
+        let items: Vec<JsonValue> = client.get(&format!("https://api.github.com/repos/{}/contents/{}", repo_slug, remote_path))
+            .send()
+            .map_err(|e| format!("Failed to fetch '{}': {}", remote_path, e))?
+            .json()
+            .map_err(|e| format!("Failed to parse JSON for '{}': {}", remote_path, e))?;
+
+        for item in items {
+            let item_type = item.get("type").and_then(JsonValue::as_str).unwrap_or("");
+            let name = item.get("name").and_then(JsonValue::as_str).ok_or("Missing name")?;
+            if item_type == "file" {
+                total_files += 1;
+            } else if item_type == "dir" {
+                stack.push(format!("{}/{}", remote_path, name));
+            }
+        }
     }
-    fs::create_dir_all(&local_pkg_path).map_err(|e| format!("Failed to create package directory: {}", e))?;
 
-    let pb = ProgressBar::new(contents.len() as u64);
+    let pb = ProgressBar::new(total_files);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
@@ -535,59 +877,10 @@ fn install_single_package(pkg_name: &str, no_confirm: bool, verbose: bool) -> Re
             .progress_chars("#>-"),
     );
 
-    for item in contents {
-        let name = match item.get("name").and_then(JsonValue::as_str) {
-            Some(n) => n,
-            None => {
-                pb.inc(1);
-                continue;
-            },
-        };
-
-        let item_type = item.get("type").and_then(JsonValue::as_str).unwrap_or("");
-
-        if item_type == "file" {
-            let download_url = match item.get("download_url").and_then(JsonValue::as_str) {
-                Some(url) => url,
-                None => {
-                    eprintln!("{}", format!("File '{}' has no download_url", name).red());
-                    pb.inc(1);
-                    continue;
-                }
-            };
-
-            if verbose {
-                pb.set_message(format!("Downloading file {}", name));
-            }
-
-            let mut file_resp = client.get(download_url)
-                .header("User-Agent", "lym-install")
-                .send()
-                .map_err(|e| format!("Failed to download file {}: {}", name, e))?;
-
-            if !file_resp.status().is_success() {
-                eprintln!("{}", format!("Failed to download file {}: HTTP {}", name, file_resp.status()).red());
-                pb.inc(1);
-                continue;
-            }
-
-            let local_file_path = local_pkg_path.join(name);
-            let mut out_file = std::fs::File::create(&local_file_path)
-                .map_err(|e| format!("Failed to create file {}: {}", local_file_path.display(), e))?;
-
-            file_resp.copy_to(&mut out_file)
-                .map_err(|e| format!("Failed to write file {}: {}", local_file_path.display(), e))?;
-        }
-        else if item_type == "dir" {
-            let sub_dir = local_pkg_path.join(name);
-            fs::create_dir_all(&sub_dir)
-                .map_err(|e| format!("Failed to create directory {}: {}", sub_dir.display(), e))?;
-        }
-        pb.inc(1);
-    }
+    download_dir_recursive(&client, repo_slug, &api_url, &local_pkg_path, verbose, &pb)?;
     pb.finish_with_message("Download complete");
 
-    println!("{}", format!("Package '{}' installed successfully.", pkg_name.bright_cyan()).bright_green());
+    println!("{}", format!("Package '{}@{}' installed successfully.", pkg_name, chosen_version).bright_green());
 
     Ok(())
 }
@@ -794,7 +1087,7 @@ fn install(args: &[String]) {
             println!("Installing package '{}'", pkg_name.bright_cyan());
         }
 
-        if let Err(e) = install_single_package(&pkg_name, no_confirm, verbose) {
+        if let Err(e) = install_single_package(&pkg_name, no_confirm, verbose, None) {
             eprintln!("{}", format!("Failed to install '{}': {}", pkg_name, e).red());
         }
     }
@@ -807,6 +1100,7 @@ fn list(args: &[String]) {
     let mut list_local = true;
     let mut list_store = false;
     let mut show_std = true;
+    let mut module_name_filter: Option<String> = None; // new arg support
 
     for arg in args {
         match arg.as_str() {
@@ -833,9 +1127,13 @@ fn list(args: &[String]) {
                 return;
             }
             _ => {
-                eprintln!("{}", format!("Unknown argument: '{}'", arg).red());
-                command_help("list");
-                return;
+                if arg.starts_with('-') {
+                    eprintln!("{}", format!("Unknown argument: '{}'", arg).red());
+                    command_help("list");
+                    return;
+                } else {
+                    module_name_filter = Some(arg.clone()); // treat as module name
+                }
             }
         }
     }
@@ -855,6 +1153,88 @@ fn list(args: &[String]) {
         .unwrap_or_else(|| json!({}));
 
     let lucia_path_str = config_json.get("lucia_path").and_then(JsonValue::as_str);
+
+    let process_modules = |dir: &Path, list_std: bool, show_all_versions: bool| {
+        if !dir.exists() || !dir.is_dir() {
+            return;
+        }
+
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        for entry in entries {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                let module_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("<unknown>");
+
+                if let Some(ref filter) = module_name_filter {
+                    if module_name != filter {
+                        continue;
+                    }
+                }
+
+                let is_std = STD_LIBS.contains_key(module_name);
+                if !list_std && is_std {
+                    continue;
+                }
+
+                let mut versions = vec![];
+                let mut description: Option<String> = None;
+
+                if path.is_dir() {
+                    let manifest_path = path.join("manifest.json");
+                    if manifest_path.exists() {
+                        if let Ok(manifest_str) = fs::read_to_string(&manifest_path) {
+                            if let Ok(manifest_json) = serde_json::from_str::<JsonValue>(&manifest_str) {
+                                if !show_all_versions {
+                                    versions.push(manifest_json.get("version").and_then(JsonValue::as_str).unwrap_or("unknown").to_string());
+                                    description = manifest_json.get("description").and_then(JsonValue::as_str).map(|s| s.to_string());
+                                } else {
+                                    // list all versions locally
+                                    if let Ok(version_entries) = fs::read_dir(&path) {
+                                        for ve in version_entries.flatten() {
+                                            let ver_name = ve.file_name().to_string_lossy().to_string();
+                                            versions.push(ver_name);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if is_std {
+                    if let Some(std_info) = STD_LIBS.get(module_name) {
+                        versions.push(std_info.version.to_string());
+                        description = Some(std_info.description.to_string());
+                    }
+                }
+
+                for ver in versions {
+                    let mut line = if is_std {
+                        format!("  {} [standard lib]", module_name.bright_blue().bold())
+                    } else {
+                        format!("  {}", module_name.bright_cyan())
+                    };
+
+                    if show_ver {
+                        line += &format!(" v{}", ver);
+                    }
+                    if show_desc {
+                        if let Some(ref desc) = description {
+                            if !desc.is_empty() {
+                                line += &format!(" - {}", desc);
+                            }
+                        }
+                    }
+
+                    println!("{}", line);
+                }
+            }
+        }
+    };
 
     if list_local {
         if lucia_path_str.is_none() {
@@ -876,258 +1256,189 @@ fn list(args: &[String]) {
         }
 
         println!("{}", "Local modules:".bright_green().bold());
-
-        let mut found_any = false;
-
-        for entry in fs::read_dir(&libs_dir).unwrap() {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-
-                let module_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("<unknown>");
-
-                let is_std = STD_LIBS.contains_key(module_name)
-                    || module_name == "std"
-                    || module_name == "requests";
-
-                if !show_std && is_std {
-                    continue;
-                }
-
-                found_any = true;
-
-                let mut version: Option<String> = None;
-                let mut description: Option<String> = None;
-
-                if path.is_dir() {
-                    let manifest_path = path.join("manifest.json");
-                    if manifest_path.exists() {
-                        if let Ok(manifest_str) = fs::read_to_string(&manifest_path) {
-                            if let Ok(manifest_json) = serde_json::from_str::<JsonValue>(&manifest_str) {
-                                version = manifest_json.get("version").and_then(JsonValue::as_str).map(|s| s.to_string());
-                                description = manifest_json.get("description").and_then(JsonValue::as_str).map(|s| s.to_string());
-                            }
-                        }
-                    }
-                } else if path.is_file() {
-                    if module_name.ends_with(".lc") || module_name.ends_with(".lucia") {
-                        version = None;
-                        description = None;
-                    }
-                }
-
-                if is_std {
-                    if let Some(std_info) = STD_LIBS.get(module_name) {
-                        description = Some(std_info.description.to_string());
-                        version = Some(std_info.version.to_string());
-                    }
-                }
-
-                let mut line = if is_std {
-                    format!("  {} {}", module_name.bright_blue().bold(), "[standard lib]".purple())
-                } else {
-                    format!("  {}", module_name.bright_cyan())
-                };
-
-                if show_ver {
-                    line += &format!(" v{}", version.as_deref().unwrap_or("unknown"));
-                }
-                if show_desc {
-                    if let Some(desc) = &description {
-                        if !desc.is_empty() {
-                            line += &format!(" - {}", desc);
-                        }
-                    }
-                }
-
-                println!("{}", line);
-            }
-        }
-
-        if !found_any {
-            println!("{}", "No local modules found ".yellow());
-        }
+        process_modules(&libs_dir, show_std, module_name_filter.is_some());
     }
 
     if list_store {
         let store_dir = lym_dir.join("store");
-    
         if !store_dir.exists() || !store_dir.is_dir() {
             eprintln!("{}", format!("store directory not found at {}", store_dir.display()).red());
             return;
         }
-    
-        println!("{}", "Stored (disabled) modules:".bright_green().bold());
-    
-        let mut found_any = false;
-    
-        for entry in fs::read_dir(&store_dir).unwrap_or_else(|_| {
-            eprintln!("{}", format!("Failed to read store dir at {}", store_dir.display()).red());
-            exit(1);
-        }) {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-    
-                let module_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("<unknown>");
-    
-                let is_std = STD_LIBS.contains_key(module_name)
-                    || module_name == "std"
-                    || module_name == "requests";
-    
-                if !show_std && is_std {
-                    continue;
-                }
-    
-                found_any = true;
-    
-                let mut version: Option<String> = None;
-                let mut description: Option<String> = None;
-    
-                if path.is_dir() {
-                    let manifest_path = path.join("manifest.json");
-                    if manifest_path.exists() {
-                        if let Ok(manifest_str) = fs::read_to_string(&manifest_path) {
-                            if let Ok(manifest_json) = serde_json::from_str::<JsonValue>(&manifest_str) {
-                                version = manifest_json.get("version").and_then(JsonValue::as_str).map(|s| s.to_string());
-                                description = manifest_json.get("description").and_then(JsonValue::as_str).map(|s| s.to_string());
-                            }
-                        }
-                    }
-                } else if path.is_file() {
-                    if module_name.ends_with(".lc") || module_name.ends_with(".lucia") {
-                        version = None;
-                        description = None;
-                    }
-                }
-    
-                if is_std {
-                    if let Some(std_info) = STD_LIBS.get(module_name) {
-                        description = Some(std_info.description.to_string());
-                        version = Some(std_info.version.to_string());
-                    }
-                }
-    
-                let mut line = if is_std {
-                    format!("  {} {}", module_name.bright_blue().bold(), "[standard lib]".purple())
-                } else {
-                    format!("  {}", module_name.bright_cyan())
-                };
-    
-                if show_ver {
-                    line += &format!(" v{}", version.as_deref().unwrap_or("unknown"));
-                }
-                if show_desc {
-                    if let Some(desc) = &description {
-                        if !desc.is_empty() {
-                            line += &format!(" - {}", desc);
-                        }
-                    }
-                }
-    
-                println!("{}", line);
-            }
-        }
-    
-        if !found_any {
-            println!("{}", "No stored modules found".yellow());
-        }
+
+        println!("{}", "Stored modules:".bright_green().bold());
+        process_modules(&store_dir, show_std, module_name_filter.is_some());
     }
 
     if list_remote {
-        let repo_url = config_json.get("repository").and_then(JsonValue::as_str);
-        if repo_url.is_none() {
-            eprintln!("{}", "Repository URL not set in config.".red());
-            return;
-        }
-
-        let _repo_url = repo_url.unwrap();
-
         let repo_slug = config_json.get("repository_slug").and_then(JsonValue::as_str);
         if repo_slug.is_none() {
             eprintln!("{}", "Repository slug not set in config.".red());
             return;
         }
-
         let repo_slug = repo_slug.unwrap();
 
-        let api_url = format!("https://api.github.com/repos/{}/contents/libs", repo_slug);
+        let mut headers = HeaderMap::new();
+        headers.insert(USER_AGENT, HeaderValue::from_static("lym-list"));
+        if let Some((username, token)) = get_lym_auth() {
+            let auth_val = general_purpose::STANDARD.encode(format!("{}:{}", username, token));
+            headers.insert(AUTHORIZATION, HeaderValue::from_str(&format!("Basic {}", auth_val)).unwrap());
+        }
 
         let client = Client::builder()
-            .timeout(Duration::from_secs(5))
+            .default_headers(headers)
+            .timeout(Duration::from_secs(30))
             .build()
-            .unwrap();
+            .unwrap_or_else(|e| {
+                eprintln!("{}", format!("Failed to build HTTP client: {}", e).red());
+                exit(1);
+            });
 
-        let resp = client.get(&api_url)
-            .header("User-Agent", "lym-list")
-            .send();
+        let api_url = format!("https://api.github.com/repos/{}/contents/", repo_slug);
+        let resp = client.get(&api_url).send();
 
         if let Ok(resp) = resp {
             if resp.status().is_success() {
-                let contents: Result<Vec<JsonValue>, _> = resp.json();
+                let contents: Vec<JsonValue> = resp.json().unwrap_or_else(|_| {
+                    eprintln!("{}", "Failed to parse GitHub API response.".red());
+                    exit(1);
+                });
 
-                if let Ok(contents) = contents {
-                    println!("{}", "Remote modules:".bright_green().bold());
+                println!("{}", "Remote modules:".bright_green().bold());
+                let mut found_any = false;
 
-                    let mut found_any = false;
+                for item in contents.iter() {
+                    let name = item.get("name").and_then(JsonValue::as_str).unwrap_or("");
+                    let item_type = item.get("type").and_then(JsonValue::as_str).unwrap_or("");
+                    if item_type != "dir" { continue; }
+                    if let Some(ref filter) = module_name_filter {
+                        if name != filter { continue; }
+                    }
+                    found_any = true;
 
-                    for item in contents {
-                        let name = item.get("name").and_then(JsonValue::as_str).unwrap_or("");
-                        let item_type = item.get("type").and_then(JsonValue::as_str).unwrap_or("");
+                    let versions_url = format!("https://api.github.com/repos/{}/contents/{}", repo_slug, name);
+                    let versions_resp = client.get(&versions_url).send();
+                    if let Ok(versions_resp) = versions_resp {
+                        if versions_resp.status().is_success() {
+                            let version_dirs: Vec<JsonValue> = versions_resp.json().unwrap_or_default();
+                            let mut latest_version: Option<String> = None;
+                            let mut all_versions = vec![];
 
-                        if item_type == "dir" {
-                            found_any = true;
+                            for vdir in version_dirs.iter() {
+                                let vname = vdir.get("name").and_then(JsonValue::as_str).unwrap_or("");
+                                if !vname.starts_with('@') { continue; }
+                                let ver = &vname[1..];
+                                all_versions.push(ver.to_string());
+                                if let Some(lat) = &latest_version {
+                                    if cmp_version(lat, ver) == Some(std::cmp::Ordering::Less) {
+                                        latest_version = Some(ver.to_string());
+                                    }
+                                } else { latest_version = Some(ver.to_string()); }
+                            }
 
-                            let manifest_url = format!("https://api.github.com/repos/{}/contents/libs/{}/manifest.json", repo_slug, name);
+                            if module_name_filter.is_some() {
+                                // Fetch latest version for author info
+                                let latest_ver = latest_version.as_ref().unwrap();
+                                let manifest_url = format!(
+                                    "https://api.github.com/repos/{}/contents/{}/@{}/manifest.json",
+                                    repo_slug, name, latest_ver
+                                );
 
-                            let manifest_resp = client.get(&manifest_url)
-                                .header("User-Agent", "lym-list")
-                                .send();
-
-                            if let Ok(manifest_resp) = manifest_resp {
-                                if manifest_resp.status().is_success() {
-                                    if let Ok(manifest_json) = manifest_resp.json::<JsonValue>() {
-                                        if let Some(content_encoded) = manifest_json.get("content").and_then(JsonValue::as_str) {
-                                            let decoded_bytes = general_purpose::STANDARD.decode(content_encoded.replace('\n', "")).unwrap_or_default();
-                                            if let Ok(decoded_str) = String::from_utf8(decoded_bytes) {
-                                                if let Ok(manifest) = serde_json::from_str::<JsonValue>(&decoded_str) {
-                                                    let version = manifest.get("version").and_then(JsonValue::as_str).unwrap_or("unknown");
-                                                    let desc = manifest.get("description").and_then(JsonValue::as_str).unwrap_or("");
-                                                    let mut line = format!("  {}", name.bright_cyan());
-                                                    if show_ver {
-                                                        line += &format!(" v{}", version);
+                                let mut authors: Vec<String> = vec![];
+                                if let Ok(manifest_resp) = client.get(&manifest_url).send() {
+                                    if manifest_resp.status().is_success() {
+                                        if let Ok(manifest_json) = manifest_resp.json::<JsonValue>() {
+                                            if let Some(content_encoded) = manifest_json.get("content").and_then(JsonValue::as_str) {
+                                                if let Ok(decoded_bytes) = general_purpose::STANDARD.decode(content_encoded.replace('\n', "")) {
+                                                    if let Ok(decoded_str) = String::from_utf8(decoded_bytes) {
+                                                        if let Ok(manifest) = serde_json::from_str::<JsonValue>(&decoded_str) {
+                                                            authors = manifest.get("authors")
+                                                                .and_then(JsonValue::as_array)
+                                                                .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect())
+                                                                .unwrap_or_default();
+                                                        }
                                                     }
-                                                    if show_desc && !desc.is_empty() {
-                                                        line += &format!(" - {}", desc);
-                                                    }
-                                                    println!("{}", line);
-                                                    continue;
                                                 }
                                             }
                                         }
                                     }
                                 }
-                            }
 
-                            println!("  {}", name.bright_cyan());
-                        } else if item_type == "file" {
-                            if name.ends_with(".lc") || name.ends_with(".lucia") {
-                                found_any = true;
-                                println!("  {}", name.bright_cyan());
+                                let author_str = if authors.is_empty() { "unknown".to_string() } else {
+                                    authors.iter().map(|a| a.yellow().to_string()).collect::<Vec<_>>().join(", ")
+                                };
+
+                                println!("{} - {}", name.bright_cyan(), author_str);
+
+                                // Track previous deps to omit duplicates
+                                let mut prev_deps: Option<HashMap<String, String>> = None;
+
+                                for ver in all_versions {
+                                    let manifest_url = format!("https://api.github.com/repos/{}/contents/{}/@{}/manifest.json", repo_slug, name, ver);
+                                    if let Ok(manifest_resp) = client.get(&manifest_url).send() {
+                                        if manifest_resp.status().is_success() {
+                                            if let Ok(manifest_json) = manifest_resp.json::<JsonValue>() {
+                                                if let Some(content_encoded) = manifest_json.get("content").and_then(JsonValue::as_str) {
+                                                    if let Ok(decoded_bytes) = general_purpose::STANDARD.decode(content_encoded.replace('\n', "")) {
+                                                        if let Ok(decoded_str) = String::from_utf8(decoded_bytes) {
+                                                            if let Ok(manifest) = serde_json::from_str::<JsonValue>(&decoded_str) {
+                                                                let v_desc = manifest.get("description").and_then(JsonValue::as_str).unwrap_or("");
+                                                                println!("   {} - {}", format!("v{}", ver).green(), v_desc);
+
+                                                                // handle deps
+                                                                if let Some(deps_json) = manifest.get("dependencies").and_then(JsonValue::as_object) {
+                                                                    let deps_map: HashMap<String, String> = deps_json.iter()
+                                                                        .filter_map(|(k,v)| v.as_str().map(|vv| (k.clone(), vv.to_string())))
+                                                                        .collect();
+
+                                                                    if Some(&deps_map) != prev_deps.as_ref() && !deps_map.is_empty() {
+                                                                        println!("   deps:");
+                                                                        for (dep_name, dep_ver) in deps_map.iter() {
+                                                                            println!("      {} - v{}", dep_name.bright_magenta(), dep_ver.green());
+                                                                        }
+                                                                    }
+                                                                    prev_deps = Some(deps_map);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if let Some(latest) = latest_version {
+                                // normal listing: show only latest
+                                let manifest_url = format!("https://api.github.com/repos/{}/contents/{}/@{}/manifest.json", repo_slug, name, latest);
+                                let mut description = String::new();
+                                if let Ok(manifest_resp) = client.get(&manifest_url).send() {
+                                    if manifest_resp.status().is_success() {
+                                        if let Ok(manifest_json) = manifest_resp.json::<JsonValue>() {
+                                            if let Some(content_encoded) = manifest_json.get("content").and_then(JsonValue::as_str) {
+                                                if let Ok(decoded_bytes) = general_purpose::STANDARD.decode(content_encoded.replace('\n', "")) {
+                                                    if let Ok(decoded_str) = String::from_utf8(decoded_bytes) {
+                                                        if let Ok(manifest) = serde_json::from_str::<JsonValue>(&decoded_str) {
+                                                            description = manifest.get("description").and_then(JsonValue::as_str).unwrap_or("").to_string();
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                let mut line = format!("  {}", name.bright_cyan());
+                                if show_ver { line += &format!(" v{} (latest)", latest); }
+                                if show_desc && !description.is_empty() { line += &format!(" - {}", description); }
+                                println!("{}", line);
                             }
                         }
                     }
-
-                    if !found_any {
-                        println!("{}", "No remote modules found".yellow());
-                    }
-                } else {
-                    eprintln!("{}", "Failed to parse GitHub API response.".red());
                 }
-            } else {
-                if resp.status() == reqwest::StatusCode::NOT_FOUND {
-                    println!("{}", "The repository doesn't have a 'libs' directory.".red());
-                    return;
-                }                
-                eprintln!("{}", format!("GitHub API error: {}", resp.status()).red());
+
+                if !found_any {
+                    println!("{}", "No remote modules found".yellow());
+                }
             }
         } else {
             eprintln!("{}", "Failed to connect to GitHub API.".red());
@@ -1138,7 +1449,6 @@ fn list(args: &[String]) {
 fn download(args: &[String]) {
     let mut no_confirm = false;
     let mut verbose = false;
-
     let mut positional_args = Vec::new();
 
     for arg in args {
@@ -1164,11 +1474,22 @@ fn download(args: &[String]) {
         return;
     }
 
-    let package_name = &positional_args[0];
+    let package_arg = &positional_args[0];
+    let (package_name, requested_version) = match package_arg.split_once('@') {
+        Some((name, version)) => (name, Some(version)),
+        None => (package_arg.as_str(), None),
+    };
+
     let output_path = if positional_args.len() >= 2 {
-        PathBuf::from(&positional_args[1])
+        std::path::PathBuf::from(&positional_args[1])
     } else {
-        PathBuf::from(format!("./{}/", package_name))
+        match get_lym_dir() {
+            Ok(p) => p.join("libs").join(package_name),
+            Err(e) => {
+                eprintln!("{}", format!("Failed to get lym dir: {}", e).red());
+                return;
+            }
+        }
     };
 
     let lym_dir = match get_lym_dir() {
@@ -1180,12 +1501,12 @@ fn download(args: &[String]) {
     };
 
     let config_path = lym_dir.join("config.json");
-    let config_json: JsonValue = fs::read_to_string(&config_path)
+    let config_json: serde_json::Value = fs::read_to_string(&config_path)
         .ok()
         .and_then(|data| serde_json::from_str(&data).ok())
-        .unwrap_or_else(|| json!({}));
+        .unwrap_or_else(|| serde_json::json!({}));
 
-    let repo_slug = match config_json.get("repository_slug").and_then(JsonValue::as_str) {
+    let repo_slug = match config_json.get("repository_slug").and_then(serde_json::Value::as_str) {
         Some(s) => s,
         None => {
             eprintln!("{}", "Repository slug not set in config.".red());
@@ -1193,12 +1514,25 @@ fn download(args: &[String]) {
         }
     };
 
-    let api_url = format!(
-        "https://api.github.com/repos/{}/contents/libs/{}",
-        repo_slug, package_name
-    );
+    let headers = {
+        let mut headers = HeaderMap::new();
+        headers.insert(USER_AGENT, HeaderValue::from_static("lym-download"));
 
-    let client = match Client::builder().timeout(Duration::from_secs(5)).build() {
+        if let Some((username, token)) = get_lym_auth() {
+            let auth_val = format!("Basic {}", general_purpose::STANDARD.encode(format!("{}:{}", username, token)));
+            if let Ok(h) = HeaderValue::from_str(&auth_val) {
+                headers.insert(AUTHORIZATION, h);
+            }
+        }
+
+        headers
+    };
+
+    let client = match Client::builder()
+        .default_headers(headers)
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{}", format!("Failed to build HTTP client: {}", e).red());
@@ -1206,34 +1540,57 @@ fn download(args: &[String]) {
         }
     };
 
-    let resp = match client.get(&api_url).header("User-Agent", "lym-download").send() {
-        Ok(r) => r,
-        Err(_) => {
-            eprintln!("{}", "Failed to connect to GitHub API.".red());
-            return;
+    let version_folder = match requested_version {
+        Some(v) => format!("@{}", v),
+        None => {
+            let api_url = format!("https://api.github.com/repos/{}/contents/{}", repo_slug, package_name);
+            let resp = match client.get(&api_url).send() {
+                Ok(r) => r,
+                Err(_) => {
+                    eprintln!("{}", "Failed to connect to GitHub API.".red());
+                    return;
+                }
+            };
+            if !resp.status().is_success() {
+                eprintln!("{}", format!("GitHub API error: {}", resp.status()).red());
+                return;
+            }
+
+            let items: Vec<serde_json::Value> = match resp.json() {
+                Ok(f) => f,
+                Err(_) => {
+                    eprintln!("{}", "Failed to parse GitHub API response.".red());
+                    return;
+                }
+            };
+
+            let mut versions: Vec<String> = items
+                .iter()
+                .filter_map(|i| i.get("name").and_then(serde_json::Value::as_str))
+                .filter(|n| n.starts_with('@'))
+                .map(|s| s.to_string())
+                .collect();
+
+            versions.sort_by(|a, b| {
+                cmp_version(&a[1..], &b[1..]).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            if let Some(latest) = versions.last() {
+                latest.clone()
+            } else {
+                eprintln!("{}", "No versions found for package.".red());
+                return;
+            }
         }
     };
 
-    if !resp.status().is_success() {
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            eprintln!("{}", format!("Package '{}' not found in repository.", package_name).red());
-        } else {
-            eprintln!("{}", format!("GitHub API error: {}", resp.status()).red());
-        }
-        return;
-    }
-
-    let files: Vec<JsonValue> = match resp.json() {
-        Ok(f) => f,
-        Err(_) => {
-            eprintln!("{}", "Failed to parse GitHub API response.".red());
-            return;
-        }
-    };
+    let final_output_path = output_path.join(&version_folder)
+        .canonicalize()
+        .unwrap_or(output_path.join(&version_folder));
 
     if !no_confirm {
-        let confirm = Confirm::new()
-            .with_prompt(format!("Download package '{}' into '{}'", package_name, output_path.display()))
+        let confirm = dialoguer::Confirm::new()
+            .with_prompt(format!("Download package '{}' into '{}'? ", package_name, final_output_path.display()))
             .default(true)
             .interact();
 
@@ -1243,66 +1600,79 @@ fn download(args: &[String]) {
         }
     }
 
-    if output_path.exists() && !output_path.is_dir() {
-        eprintln!("{}", format!("Output path '{}' already exists and is not a directory.", output_path.display()).red());
-        return;
-    }
-
-    if !output_path.exists() {
-        if let Err(e) = fs::create_dir_all(&output_path) {
-            eprintln!("{}", format!("Failed to create output directory '{}': {}", output_path.display(), e).red());
+    if !final_output_path.exists() {
+        if let Err(e) = fs::create_dir_all(&final_output_path) {
+            eprintln!("{}", format!("Failed to create directory '{}': {}", final_output_path.display(), e).red());
             return;
         }
     }
 
-    for file in files {
-        let name = file.get("name").and_then(JsonValue::as_str).unwrap_or("unknown");
-        let download_url = file.get("download_url").and_then(JsonValue::as_str);
-        if download_url.is_none() {
-            if verbose {
-                eprintln!("{}", format!("Skipping '{}': no download URL", name).red());
-            }
-            continue;
+    let api_url = format!("https://api.github.com/repos/{}/contents/{}/{}", repo_slug, package_name, version_folder);
+    let resp = match client.get(&api_url).send() {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("{}", "Failed to connect to GitHub API.".red());
+            return;
         }
+    };
+    if !resp.status().is_success() {
+        eprintln!("{}", format!("Failed to fetch remote package: {}", resp.status()).red());
+        return;
+    }
 
-        let url = download_url.unwrap();
-        let dest_path = output_path.join(name);
-
-        let file_resp = match client.get(url).header("User-Agent", "lym-download").send() {
-            Ok(r) => r,
-            Err(_) => {
-                eprintln!("{}", format!("Failed to download '{}'", name).red());
-                continue;
-            }
-        };
-
-        if !file_resp.status().is_success() {
-            eprintln!("{}", format!("Failed to fetch '{}': {}", name, file_resp.status()).red());
-            continue;
+    let files: Vec<serde_json::Value> = match resp.json() {
+        Ok(f) => f,
+        Err(_) => {
+            eprintln!("{}", "Failed to parse remote package directory.".red());
+            return;
         }
+    };
 
-        let bytes = match file_resp.bytes() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("{}", format!("Failed to read content of '{}'", name).red());
-                continue;
+    fn download_item(client: &Client, item: &serde_json::Value, dest: &Path, verbose: bool) {
+        if let Some(name) = item.get("name").and_then(serde_json::Value::as_str) {
+            let item_type = item.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+            if item_type == "file" {
+                if let Some(url) = item.get("download_url").and_then(serde_json::Value::as_str) {
+                    let dest_path = dest.join(name);
+                    let pb = ProgressBar::new_spinner();
+                    pb.set_message(format!("Downloading {}", name));
+                    pb.enable_steady_tick(Duration::from_millis(100));
+
+                    if let Ok(resp) = client.get(url).send() {
+                        if resp.status().is_success() {
+                            if let Ok(bytes) = resp.bytes() {
+                                let _ = fs::write(&dest_path, &bytes);
+                                if verbose {
+                                    pb.finish_with_message(format!("Downloaded '{}'", dest_path.display()));
+                                } else {
+                                    pb.finish_and_clear();
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if item_type == "dir" {
+                let sub_dir = dest.join(name);
+                let _ = fs::create_dir_all(&sub_dir);
+
+                if let Some(url) = item.get("url").and_then(serde_json::Value::as_str) {
+                    if let Ok(resp) = client.get(url).send() {
+                        if let Ok(children) = resp.json::<Vec<serde_json::Value>>() {
+                            for child in children {
+                                download_item(client, &child, &sub_dir, verbose);
+                            }
+                        }
+                    }
+                }
             }
-        };
-
-        if let Err(e) = fs::write(&dest_path, &bytes) {
-            eprintln!("{}", format!("Failed to write to {}: {}", dest_path.display(), e).red());
-            continue;
-        }
-
-        if verbose {
-            println!("{}", format!("Downloaded '{}'", dest_path.display()).bright_green());
         }
     }
-    if verbose {
-        println!("{}", format!("All files downloaded to '{}'", output_path.display()).bright_green());
-    } else {
-        println!("{}", "Download complete.".bright_green());
+
+    for file in &files {
+        download_item(&client, file, &final_output_path, verbose);
     }
+
+    println!("{}", format!("Package '{}' downloaded to '{}'", package_name, final_output_path.display()).bright_green());
 }
 
 fn remove(args: &[String]) {
@@ -1975,8 +2345,9 @@ fn new(args: &[String]) {
             let manifest = json!({
                 "name": name,
                 "version": "0.1.0",
-                "description": "",
+                "description": "A simple Lucia package",
                 "required_lucia_version": format!("^{}", required_version),
+                "license": "MIT",
             });            
 
             if let Err(e) = fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap()) {
@@ -1984,7 +2355,7 @@ fn new(args: &[String]) {
                 return;
             }
 
-            if fs::write(path.join(&main_file), r#"print("Hello world")"#).is_err() {
+            if fs::write(path.join(&main_file), "fun main() -> void:\n    print(\"Hello world\")\nend\n\nmain()\n").is_err() {
                 eprintln!("{}", "Failed to create main file.".red());
             }
 
@@ -2008,6 +2379,231 @@ fn new(args: &[String]) {
 
         _ => unreachable!(),
     }
+}
+
+fn publish(args: &[String]) {
+    let verbose = args.iter().any(|s| s == "-v" || s == "--verbose");
+    let no_confirm = args.iter().any(|s| s == "--no-confirm");
+    let path_arg = args.iter().find(|s| !s.starts_with('-')).map_or(".", |s| s.as_str());
+    if args.iter().any(|s| s == "--help" || s == "-h") {
+        command_help("publish");
+        return;
+    }
+    let path = Path::new(path_arg);
+
+    if !path.exists() || !path.is_dir() {
+        eprintln!("{}", "Provided path does not exist or is not a directory.".red());
+        return;
+    }
+
+    let manifest_path = path.join("manifest.json");
+    if !manifest_path.exists() {
+        eprintln!("{}", "manifest.json not found in the directory.".red());
+        return;
+    }
+
+    let manifest_data = fs::read_to_string(&manifest_path).unwrap_or_else(|e| {
+        eprintln!("{}", format!("Failed to read manifest.json: {}", e).red());
+        exit(1);
+    });
+
+    let manifest: Value = serde_json::from_str(&manifest_data).unwrap_or_else(|e| {
+        eprintln!("{}", format!("Invalid manifest.json: {}", e).red());
+        exit(1);
+    });
+
+    let lib_name = manifest.get("name").and_then(Value::as_str).unwrap_or_else(|| {
+        eprintln!("{}", "manifest.json missing 'name' field.".red());
+        exit(1);
+    });
+
+    let version = manifest.get("version").and_then(Value::as_str).unwrap_or_else(|| {
+        eprintln!("{}", "manifest.json missing 'version' field.".red());
+        exit(1);
+    });
+
+    let (username, token) = get_lym_auth().unwrap_or_else(|| {
+        eprintln!("{}", "No Lym auth found. Run `lym login` first.".red());
+        exit(1);
+    });
+
+    if !no_confirm {
+        let confirm = Confirm::new()
+            .with_prompt(format!("You are about to publish {}@{} to the remote repository. Continue?", lib_name, version))
+            .default(true)
+            .interact()
+            .unwrap_or(false);
+
+        if !confirm {
+            println!("{}", "Publish cancelled by user.".yellow());
+            return;
+        }
+    }
+
+    let lym_dir = get_lym_dir().unwrap_or_else(|e| {
+        eprintln!("{}", format!("Failed to get Lym dir: {}", e).red());
+        exit(1);
+    });
+    let config_path = lym_dir.join("config.json");
+    let config: Value = fs::read_to_string(&config_path)
+        .map(|s| serde_json::from_str(&s))
+        .unwrap_or_else(|_| {
+            eprintln!("{}", "Failed to read config.json".red());
+            exit(1);
+        })
+        .unwrap();
+
+    let repo_slug = config.get("repository_slug").and_then(Value::as_str).unwrap_or_else(|| {
+        eprintln!("{}", "repository_slug missing in config.json".red());
+        exit(1);
+    });
+
+    let client = Client::new();
+    let package_url = format!("https://api.github.com/repos/{}/contents/{}", repo_slug, lib_name);
+
+    let resp = client.get(&package_url)
+        .header("User-Agent", "lym-publish")
+        .basic_auth(&username, Some(&token))
+        .send();
+
+    if let Ok(r) = resp {
+        if r.status().is_success() {
+            let remote: Vec<Value> = r.json().unwrap_or_else(|_| {
+                eprintln!("{}", "Failed to parse remote contents".red());
+                exit(1);
+            });
+
+            let mut versions: Vec<String> = remote.iter()
+                .filter_map(|item| item.get("name")?.as_str())
+                .filter(|name| name.starts_with('@'))
+                .map(|s| s[1..].to_string())
+                .collect();
+
+            if !versions.is_empty() {
+                versions.sort_by(|a, b| {
+                    cmp_version(a, b).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                let last_version = versions.last().unwrap();
+                if !is_next_version(version, last_version) {
+                    eprintln!("{}", format!("Version {} is not valid after last published version {}", version, last_version).red());
+                    return;
+                }
+
+                if versions.contains(&version.to_string()) {
+                    eprintln!("{}", format!("Version {} already exists remotely.", version).red());
+                    return;
+                }
+            }
+        } else if r.status() != reqwest::StatusCode::NOT_FOUND {
+            eprintln!("{}", format!("Failed to fetch remote package info: HTTP {}", r.status()).red());
+            return;
+        }
+    } else {
+        eprintln!("{}", "Failed to query remote repository".red());
+        return;
+    }
+
+    let files = collect_files(path, path);
+
+    let pb = if !verbose {
+        let pb = ProgressBar::new(files.len() as u64);
+        pb.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+            .unwrap()
+            .progress_chars("#>-"));
+        Some(pb)
+    } else { None };
+
+    for file in files.iter() {
+        let remote_path = format!("{}/@{}/{}", lib_name, version, file.to_string_lossy());
+        let content = fs::read(path.join(file)).unwrap_or_else(|_| {
+            eprintln!("{}", format!("Failed to read file {}", file.display()).red());
+            Vec::new()
+        });
+        let content_b64 = general_purpose::STANDARD.encode(&content);
+
+        let body = serde_json::json!({
+            "message": format!("Publish {}@{}", lib_name, version),
+            "content": content_b64,
+            "branch": "main"
+        });
+
+        let upload_url = format!("https://api.github.com/repos/{}/contents/{}", repo_slug, remote_path);
+        let res = client.put(&upload_url)
+            .header("User-Agent", "lym-publish")
+            .basic_auth(&username, Some(&token))
+            .json(&body)
+            .send();
+
+        match res {
+            Ok(r) if r.status().is_success() => {
+                if verbose {
+                    println!("{}", format!("Uploaded {}", file.display()).bright_green());
+                }
+            }
+            Ok(r) => {
+                eprintln!("{}", format!("Failed to upload {}: HTTP {}", file.display(), r.status()).red());
+                return;
+            }
+            Err(e) => {
+                eprintln!("{}", format!("Failed to upload {}: {}", file.display(), e).red());
+                return;
+            }
+        }
+
+        if let Some(pb) = &pb {
+            pb.inc(1);
+        }
+    }
+
+    if let Some(pb) = &pb {
+        pb.finish_with_message("Upload complete");
+    }
+
+    println!("{}", format!("Package {}@{} published successfully!", lib_name, version).bright_green());
+    println!("{}", format!("View it here: https://github.com/{}/tree/main/{}/@{}", repo_slug, lib_name, version).bright_blue());
+}
+
+fn login(args: &[String]) {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        command_help("login");
+        return;
+    }
+
+    println!("{}", "Welcome to Lym GitHub CLI login!".bright_blue());
+    println!("{}", "This will guide you to create a GitHub Personal Access Token (PAT)".bright_blue());
+    println!();
+    println!("{}", "Step 1: Open the following page in your browser:".bright_blue());
+    println!("https://github.com/settings/tokens/new?scopes=repo&description=LymCLI");
+    println!("{}", "Step 2: Create a token with the 'repo' scope.".bright_blue());
+    println!("{}", "Step 3: Copy the token and paste it below.".bright_blue());
+    println!();
+
+    print!("{}", "GitHub username: ".bright_yellow());
+    stdout().flush().unwrap();
+    let mut username = String::new();
+    stdin().read_line(&mut username).unwrap();
+    let username = username.trim();
+
+    print!("{}", "Personal Access Token: ".bright_yellow());
+    stdout().flush().unwrap();
+    let mut token = String::new();
+    stdin().read_line(&mut token).unwrap();
+    let token = token.trim();
+
+    if username.is_empty() || token.is_empty() {
+        eprintln!("{}", "Username or token cannot be empty. Login failed.".red());
+        return;
+    }
+
+    match update_lym_auth(username, token) {
+        Ok(_) => println!("{}", "Login successful! Token saved to lym_auth.json".bright_green()),
+        Err(e) => eprintln!("{}", format!("Failed to save auth: {}", e).red()),
+    }
+
+    println!();
+    println!("{}", "You can now run `lym publish` or other commands requiring authentication.".bright_blue());
 }
 
 fn main() {
@@ -2097,6 +2693,8 @@ fn main() {
         "config" => config(command_args),
         "modify" => modify(command_args),
         "new" => new(command_args),
+        "login" => login(command_args),
+        "publish" => publish(command_args),
         "--help" => print_help(),
         _ => {
             eprintln!("{}", format!("Unknown command: '{}'\n", command).red());

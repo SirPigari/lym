@@ -55,9 +55,16 @@ else
 endif
 
 run: $(TARGET)
+ifeq ($(IS_WINDOWS),cmd.exe)
+	@$(MKDIR)
+	@$(MKDIR_BIN)
+	@cmd /C "$(subst /,\\,$(TARGET_BIN)) $(ARGS)"
+else
 	@$(MKDIR)
 	@$(MKDIR_BIN)
 	@$(TARGET_BIN) $(ARGS)
+endif
+
 
 clean:
 	@$(CARGO) clean

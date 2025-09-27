@@ -33,33 +33,39 @@ Not to confuse *lym* with <a href="https://en.wikipedia.org/wiki/Lymphoma" style
 - **modify** `[package_name] [--stored] <key> [value1 [value2 ...]] [--no-confirm] [--help]`  
   Edits package manifest or stored data by changing keys and values.
 
+- **login** `[--help]`  
+  Logs in a user by storing their GitHub username and Personal Access Token.
+
+- **publish** `[package_path] [--help] [--no-confirm] [-v]`  
+  Publishes a package to the remote repository. Requires a valid manifest.json and GitHub credentials.
+
 - **new** `[package | module] [name] [path] [--no-confirm] [--help] [--main-file:<name>]`  
   Creates a new package or module at the given path.
 
 ## Example
 
-Let's say you want to install the **sha256** package.  
+Let's say you want to install the **hello-world** package.  
 First you do:
 
 ```bash
-lym install sha256
+lym install hello-world
 ```
 
 And thats all!  
 Now you can create a new lucia script and use it freely like this:
 
 ```lucia
-import sha256
+import (hello_world) from hello_world
 
-print(sha256.hash("Hello world!"))
+print(hello_world())
 ```
 
 ## Adding a Package
 
 1. Create your package, making sure it includes a valid [manifest.json](#manifest) file in the root directory.  
-2. Put the package in the [libs](./libs/) directory.
-3. Submit a pull request with your package to the repository for review.  
-4. Once approved, your package will be added and available for everyone.
+2. Register an account on GitHub and create a [Personal Access Token (PAT)](https://github.com/settings/tokens) and run `lym login` to store your credentials.
+3. Run `lym publish <path_to_your_package>` to upload it to the remote repository.
+4. Your package is now available for anyone to install using `lym install <package_name>`!
 
 ## Manifest
 
