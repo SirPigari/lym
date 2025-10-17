@@ -1,4 +1,9 @@
 use std::cmp::Ordering;
+use glob::Pattern;
+use std::collections::HashMap;
+use sha1::{Sha1, Digest};
+use std::fs;
+use std::path::Path;
 
 fn version_to_tuple(v: &str) -> Option<(u64, u64, u64)> {
     let parts: Vec<&str> = v.split('.').collect();
@@ -41,6 +46,20 @@ pub fn parse_bytes(input: &str) -> Option<u128> {
     };
 
     Some((number * multiplier as f64) as u128)
+}
+
+pub fn format_bytes(bytes: u64) -> String {
+    if bytes < 1000 {
+        format!("{} B", bytes)
+    } else if bytes < 1_000_000 {
+        format!("{:.2} KB", bytes as f64 / 1000.0)
+    } else if bytes < 1_000_000_000 {
+        format!("{:.2} MB", bytes as f64 / 1_000_000.0)
+    } else if bytes < 1_000_000_000_000 {
+        format!("{:.2} GB", bytes as f64 / 1_000_000_000.0)
+    } else {
+        format!("{:.2} TB", bytes as f64 / 1_000_000_000_000.0)
+    }
 }
 
 pub fn json_type(val: &serde_json::Value) -> &'static str {
@@ -220,4 +239,72 @@ pub fn levenshtein_distance(a: &str, b: &str) -> usize {
         }
     }
     costs[b.len()]
+}
+
+pub fn git_blob_hash(path: &Path) -> std::io::Result<String> {
+    let data = fs::read(path)?;
+    let header = format!("blob {}\0", data.len());
+    let mut hasher = Sha1::new();
+    hasher.update(header.as_bytes());
+    hasher.update(&data);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn get_current_platform() -> &'static str {
+    #[cfg(target_os = "windows")]
+    return "windows";
+    #[cfg(target_os = "linux")]
+    return "linux";
+    #[cfg(target_os = "macos")]
+    return "macos";
+    #[cfg(target_os = "freebsd")]
+    return "freebsd";
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+    return "unknown";
+}
+
+pub fn should_ignore_file(file_path: &str, ignore_patterns: &[String]) -> bool {
+    for pattern_str in ignore_patterns {
+        if let Ok(pattern) = Pattern::new(pattern_str) {
+            if pattern.matches(file_path) {
+                return true;
+            }
+        }
+        
+        if pattern_str.ends_with('/') {
+            let pattern_dir = pattern_str.trim_end_matches('/');
+            let pattern_path = Path::new(pattern_dir);
+            let file = Path::new(file_path);
+            
+            if file.starts_with(pattern_path) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[derive(Debug)]
+pub struct LymConfig {
+    pub ignore: Vec<String>,
+    pub supported_platforms: Vec<String>,
+    pub platform_ignore: HashMap<String, Vec<String>>,
+    pub scripts: HashMap<String, String>,
+    pub overwrite_existing: bool,
+    pub ignore_hashes: HashMap<String, String>,
+    pub update_fresh: bool,
+}
+
+impl Default for LymConfig {
+    fn default() -> Self {
+        LymConfig {
+            ignore: vec![],
+            supported_platforms: vec!["windows".to_string(), "linux".to_string(), "macos".to_string(), "freebsd".to_string()],
+            platform_ignore: HashMap::new(),
+            scripts: HashMap::new(),
+            overwrite_existing: false,
+            ignore_hashes: HashMap::new(),
+            update_fresh: false,
+        }
+    }
 }

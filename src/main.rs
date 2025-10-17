@@ -1,27 +1,30 @@
+use base64::{engine::general_purpose, Engine as _};
 use colored::*;
+use dialoguer::{Confirm, self};
+
+use getch_rs::{Getch, Key};
+use indicatif::{ProgressBar, ProgressStyle, self};
+use reqwest::blocking::Client;
+use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT, AUTHORIZATION};
+use serde_json::{Value as JsonValue, Value, json};
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io;
+use std::io::{stdout, stdin, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
-use indicatif::{ProgressBar, ProgressStyle, self};
-use dialoguer::{Confirm, self};
 use std::time::Duration;
-use serde_json::{Value as JsonValue, json};
-use getch_rs::{Getch, Key};
-use reqwest::blocking::Client;
-use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT, AUTHORIZATION};
-use base64::{engine::general_purpose, Engine as _};
-use std::io::{stdout, stdin, Write};
-use serde_json::Value;
-use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use futures::stream::{FuturesUnordered, StreamExt};
+use tokio::time::{interval, Duration as TokioDuration};
 
 mod db;
 mod utils;
 
 use db::{STD_LIBS, load_std_libs};
-use utils::{check_version, parse_bytes, json_type, is_next_version, find_closest_match, cmp_version};
+use utils::{check_version, parse_bytes, format_bytes, json_type, is_next_version, find_closest_match, cmp_version, git_blob_hash, get_current_platform, should_ignore_file, LymConfig};
 
 // lym - Lucia package manager
 // 'lym' isnt an acronym if you were wondering
@@ -257,8 +260,8 @@ fn command_help(cmd: &str) {
                 "Usage:".bright_green().bold(),
                 "lym".bright_cyan().bold(),
                 "list".bright_cyan(),
-                "[--remote | --local | --store] [--no-desc] [--no-ver] [--no-std] [--help] [package_name]".bright_yellow(),
-                "Lists installed packages or remote packages.".bright_white()
+                "[--remote | --local | --store] [--no-desc] [-u] [-i] [--no-ver] [--no-std] [--help] [package_name]".bright_yellow(),
+                "Lists installed packages or remote packages.\nUse -u for ultra-fast listing without descriptions.\nUse -i/--info-all for comprehensive information about all packages.".bright_white()
             );
         }
         "install" => {
@@ -267,9 +270,17 @@ fn command_help(cmd: &str) {
                 "Usage:".bright_green().bold(),
                 "lym".bright_cyan().bold(),
                 "install".bright_cyan(),
-                "[package_name] [--no-confirm] [-v] [--help]".bright_yellow(),
+                "[package_name] [--no-confirm] [-v] [--target <platform>] [-t <platform>] [--help]".bright_yellow(),
                 "Installs a package from the remote repository.".bright_white()
             );
+            println!("{}", "Options:".bright_green());
+            println!("  --no-confirm        Skip confirmation prompts");
+            println!("  -v                  Enable verbose output");
+            println!("  --target <platform> Target specific platform(s) (can be used multiple times)");
+            println!("  -t <platform>       Short form of --target");
+            println!("  -t<platform>        Compact form (e.g., -twindows)");
+            println!("  -t all / -tall      Target all platforms (windows, linux, macos)");
+            println!("  --help, -h          Show this help message");
         }
         "remove" => {
             println!(
@@ -422,7 +433,6 @@ pub fn check_and_close_lucia(no_confirm: bool) -> Result<(), String> {
 
         loop {
             print!("Lucia process {} is running. Close it? ([Y]es/[A]ll/[N]one) ", pid);
-            use std::io::{stdout, Write};
             stdout().flush().unwrap();
 
             let choice = match g.getch() {
@@ -460,17 +470,269 @@ pub fn check_and_close_lucia(no_confirm: bool) -> Result<(), String> {
     Ok(())
 }
 
+async fn download_files_async(
+    _client: &Client,
+    files_to_download: Vec<(String, String, PathBuf, String, u64)>,
+    pb: &ProgressBar,
+) -> Result<(), String> {
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static("lym/1.0"));
+    
+    let config_json = std::fs::read_to_string(&get_lym_dir().unwrap().join("config.json")).ok()
+        .and_then(|content| serde_json::from_str::<JsonValue>(&content).ok());
+    
+    if let Some(config) = &config_json {
+        if let (Some(username), Some(token)) = (
+            config.get("github_username").and_then(JsonValue::as_str),
+            config.get("github_token").and_then(JsonValue::as_str)
+        ) {
+            let auth_val = general_purpose::STANDARD.encode(format!("{}:{}", username, token));
+            let auth_header = format!("Basic {}", auth_val);
+            headers.insert(AUTHORIZATION, HeaderValue::from_str(&auth_header).unwrap());
+        }
+    }
+    
+    let async_client = reqwest::Client::builder()
+        .default_headers(headers)
+        .timeout(Duration::from_secs(120))
+        .pool_max_idle_per_host(10)
+        .pool_idle_timeout(Duration::from_secs(30))
+        .tcp_keepalive(Duration::from_secs(60))
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .http2_keep_alive_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to build async HTTP client: {}", e))?;
+    
+    let download_progress = Arc::new(Mutex::new(HashMap::<String, (u64, u64)>::new()));
+    
+    let download_tasks: Vec<_> = files_to_download.into_iter().map(|(download_url, relative_path, local_file_path, _sha, size)| {
+        let client = async_client.clone();
+        let pb_clone = pb.clone();
+        let rel_path_clone = relative_path.clone();
+        let progress_clone = download_progress.clone();
+        
+        async move {
+            if let Some(parent) = local_file_path.parent() {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                    eprintln!("Failed to create directory '{}': {}", parent.display(), e);
+                    pb_clone.inc(1);
+                    return;
+                }
+            }
+            
+            let timeout_secs = std::cmp::max(30, std::cmp::min(300, 30 + (size / (1024 * 1024)) * 10));
+            
+            let (resume_from, file_mode) = match tokio::fs::metadata(&local_file_path).await {
+                Ok(metadata) => {
+                    let existing_size = metadata.len();
+                    if existing_size < size {
+                        (existing_size, "append")
+                    } else if existing_size == size {
+                        pb_clone.inc(1);
+                        return;
+                    } else {
+                        (0, "create")
+                    }
+                },
+                Err(_) => (0, "create"),
+            };
+            
+            let mut request = client.get(&download_url)
+                .timeout(Duration::from_secs(timeout_secs));
+            
+            if resume_from > 0 {
+                request = request.header("Range", format!("bytes={}-", resume_from));
+            }
+            
+            {
+                let mut progress = progress_clone.lock().unwrap();
+                progress.insert(rel_path_clone.clone(), (resume_from, size));
+            }
+            
+            match request.send().await {
+                Ok(resp) => {
+                    let is_partial_content = resp.status().as_u16() == 206;
+                    let is_success = resp.status().is_success() || is_partial_content;
+                    
+                    if !is_success {
+                        eprintln!("{}", format!("Failed to download file {}: HTTP {}", relative_path, resp.status()).red());
+                        pb_clone.inc(1);
+                        return;
+                    }
+                    
+                    let mut downloaded = resume_from;
+                    let mut stream = resp.bytes_stream();
+                    
+                    let file_result = if file_mode == "append" && resume_from > 0 {
+                        tokio::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&local_file_path).await
+                    } else {
+                        tokio::fs::File::create(&local_file_path).await
+                    };
+                    
+                    match file_result {
+                        Ok(mut file) => {
+                            use tokio::io::AsyncWriteExt;
+                            let mut write_success = true;
+                            
+                            while let Some(chunk) = stream.next().await {
+                                match chunk {
+                                    Ok(bytes) => {
+                                        downloaded += bytes.len() as u64;
+                                        
+                                        if let Err(e) = file.write_all(&bytes).await {
+                                            eprintln!("Failed to write chunk to '{}': {}", local_file_path.display(), e);
+                                            write_success = false;
+                                            break;
+                                        }
+                                        
+                                        {
+                                            let mut progress = progress_clone.lock().unwrap();
+                                            progress.insert(rel_path_clone.clone(), (downloaded, size));
+                                        }
+                                    },
+                                    Err(e) => {
+                                        eprintln!("Error downloading '{}': {}", relative_path, e);
+                                        write_success = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            if write_success {
+                                if let Err(e) = file.flush().await {
+                                    eprintln!("Failed to flush file '{}': {}", local_file_path.display(), e);
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("Failed to create file '{}': {}", local_file_path.display(), e);
+                        }
+                    }
+                },
+                Err(e) => {
+                    eprintln!("Failed to download '{}': {}", relative_path, e);
+                }
+            }
+            
+            pb_clone.inc(1);
+        }
+    }).collect();
+    
+    let progress_updater = {
+        let progress_clone = download_progress.clone();
+        let pb_clone = pb.clone();
+        tokio::spawn(async move {
+            let mut interval = interval(TokioDuration::from_millis(200));
+            tokio::time::sleep(TokioDuration::from_millis(10)).await;
+            
+            loop {
+                interval.tick().await;
+                
+                let mut progress_map = progress_clone.lock().unwrap();
+                if progress_map.is_empty() {
+                    break;
+                }
+                
+                let mut file_statuses = Vec::new();
+                let mut completed_files = Vec::new();
+                
+                let mut active_downloads: Vec<(String, u64, u64, u64)> = Vec::new();
+                
+                for (filename, (downloaded, total)) in progress_map.iter() {
+                    if *downloaded >= *total {
+                        completed_files.push(filename.clone());
+                    } else {
+                        active_downloads.push((filename.clone(), *downloaded, *total, *total));
+                    }
+                }
+                
+                active_downloads.sort_by(|a, b| b.3.cmp(&a.3));
+                
+                for (filename, downloaded, total, _) in active_downloads {
+                    file_statuses.push(format!("{} ({}/{})", 
+                        filename, 
+                        format_bytes(downloaded), 
+                        format_bytes(total)
+                    ));
+                }
+                
+                for filename in completed_files {
+                    progress_map.remove(&filename);
+                }
+                
+                if file_statuses.is_empty() {
+                    break;
+                }
+                
+                drop(progress_map);
+                
+                let message = if file_statuses.len() <= 3 {
+                    file_statuses.join(", ")
+                } else {
+                    format!("{}, {} more...", 
+                        file_statuses[..2].join(", "), 
+                        file_statuses.len() - 2
+                    )
+                };
+                
+                pb_clone.set_message(message);
+            }
+        })
+    };
+    
+    let mut stream = FuturesUnordered::new();
+    let mut tasks = download_tasks.into_iter();
+    
+    let concurrency_limit = if tasks.len() <= 5 {
+        std::cmp::min(3, tasks.len())
+    } else if tasks.len() <= 20 {
+        std::cmp::min(6, tasks.len())
+    } else if tasks.len() <= 50 {
+        std::cmp::min(10, tasks.len())
+    } else {
+        std::cmp::min(15, tasks.len())
+    };
+    
+    for _ in 0..concurrency_limit {
+        if let Some(task) = tasks.next() {
+            stream.push(task);
+        }
+    }
+    
+    while let Some(_) = stream.next().await {
+        if let Some(task) = tasks.next() {
+            stream.push(task);
+        }
+    }
+    
+    progress_updater.abort();
+    
+    Ok(())
+}
+
 fn install_single_package(
     pkg_name: &str,
     no_confirm: bool,
     verbose: bool,
     output_path: Option<&Path>,
+    target_platforms: &[String],
 ) -> Result<(), String> {
     check_and_close_lucia(no_confirm)?;
 
+    let (package_name, requested_version) = if let Some(at_pos) = pkg_name.rfind('@') {
+        let name = &pkg_name[..at_pos];
+        let version = &pkg_name[at_pos + 1..];
+        (name, Some(version))
+    } else {
+        (pkg_name, None)
+    };
+
     if !no_confirm {
         let result = Confirm::new()
-            .with_prompt(format!("Install package '{}'?", pkg_name))
+            .with_prompt(format!("Install package '{}'?", package_name))
             .default(true)
             .interact()
             .map_err(|e| format!("Failed to read user input: {}", e))?;
@@ -522,7 +784,7 @@ fn install_single_package(
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-    let versions_url = format!("https://api.github.com/repos/{}/contents/{}", repo_slug, pkg_name);
+    let versions_url = format!("https://api.github.com/repos/{}/contents/{}", repo_slug, package_name);
     let resp = client.get(&versions_url)
         .send()
         .map_err(|e| format!("Failed to fetch package versions: {}", e))?;
@@ -537,10 +799,10 @@ fn install_single_package(
                 .collect())
             .unwrap_or_default();
 
-        if let Some(s) = find_closest_match(pkg_name, &all_packages) {
-            return Err(format!("Package '{}' not found. Did you mean '{}'?", pkg_name, s));
+        if let Some(s) = find_closest_match(package_name, &all_packages) {
+            return Err(format!("Package '{}' not found. Did you mean '{}'?", package_name, s));
         } else {
-            return Err(format!("Package '{}' not found.", pkg_name));
+            return Err(format!("Package '{}' not found.", package_name));
         }
     }
 
@@ -551,12 +813,12 @@ fn install_single_package(
         JsonValue::Array(arr) => arr,
         JsonValue::Object(obj) => {
             if let Some(msg) = obj.get("message") {
-                return Err(format!("Failed to fetch package '{}': {}", pkg_name, msg));
+                return Err(format!("Failed to fetch package '{}': {}", package_name, msg));
             } else {
-                return Err(format!("Unexpected response when fetching package '{}'", pkg_name));
+                return Err(format!("Unexpected response when fetching package '{}'", package_name));
             }
         },
-        _ => return Err(format!("Unexpected response type when fetching package '{}'", pkg_name)),
+        _ => return Err(format!("Unexpected response type when fetching package '{}'", package_name)),
     };
 
     let mut version_dirs: Vec<String> = remote_items.iter()
@@ -567,19 +829,28 @@ fn install_single_package(
         .collect();
 
     if version_dirs.is_empty() {
-        return Err(format!("No versions found for package '{}'", pkg_name));
+        return Err(format!("No versions found for package '{}'", package_name));
     }
 
     version_dirs.sort_by(|a, b| cmp_version(a, b).unwrap_or(Ordering::Equal));
-    let latest_version = version_dirs.last().unwrap().clone();
-    let chosen_version = latest_version.clone();
+    
+    let chosen_version = if let Some(req_ver) = requested_version {
+        if version_dirs.contains(&req_ver.to_string()) {
+            req_ver.to_string()
+        } else {
+            return Err(format!("Version '{}' not found for package '{}'. Available versions: {:?}", 
+                req_ver, package_name, version_dirs));
+        }
+    } else {
+        version_dirs.last().unwrap().clone()
+    };
     if verbose {
-        println!("{}", format!("Installing '{}' version '{}'", pkg_name, chosen_version).bright_cyan());
+        println!("{}", format!("Installing '{}' version '{}'", package_name, chosen_version).bright_cyan());
     }
 
     let local_pkg_path = output_path
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| libs_dir.join(pkg_name));
+        .unwrap_or_else(|| libs_dir.join(package_name));
 
     let mut installed_version: Option<String> = None;
     if local_pkg_path.exists() {
@@ -597,7 +868,7 @@ fn install_single_package(
 
     if let Some(inst_ver) = installed_version.clone() {
         if cmp_version(&chosen_version, &inst_ver) == Some(Ordering::Greater) {
-            println!("{}", format!("Upgrading '{}' from version '{}' -> '{}'", pkg_name, inst_ver, chosen_version).bright_blue());
+            println!("{}", format!("Upgrading '{}' from version '{}' -> '{}'", package_name, inst_ver, chosen_version).bright_blue());
         } else if cmp_version(&chosen_version, &inst_ver) == Some(Ordering::Less) {
             if !no_confirm {
                 print!("Installed version '{}' is newer than '{}'. Downgrade? ([Y]/n) ", inst_ver, chosen_version);
@@ -611,20 +882,20 @@ fn install_single_package(
                 println!();
                 if c != 'y' { return Ok(()); }
             }
-            println!("{}", format!("Downgrading '{}' from version '{}' -> '{}'", pkg_name, inst_ver, chosen_version).bright_yellow());
+            println!("{}", format!("Downgrading '{}' from version '{}' -> '{}'", package_name, inst_ver, chosen_version).bright_yellow());
         } else {
             if !no_confirm {
                 let download = Confirm::new()
-                    .with_prompt(format!("Package '{}' is already at version '{}'. Install anyway?", pkg_name, chosen_version))
+                    .with_prompt(format!("Package '{}' is already at version '{}'. Install anyway?", package_name, chosen_version))
                     .default(true)
                     .interact()
                     .map_err(|e| format!("Failed to read user input: {}", e))?;
                 if !download {
-                    println!("{}", format!("Skipping '{}'", pkg_name).bright_green());
+                    println!("{}", format!("Skipping '{}'", package_name).bright_green());
                     return Ok(());
                 }
             } else {
-                println!("{}", format!("Package '{}' already at version '{}', proceeding with download due to no_confirm", pkg_name, chosen_version).bright_yellow());
+                println!("{}", format!("Package '{}' already at version '{}', proceeding with download due to no-confirm", package_name, chosen_version).bright_yellow());
             }
         }
         fs::remove_dir_all(&local_pkg_path)
@@ -634,9 +905,152 @@ fn install_single_package(
     fs::create_dir_all(&local_pkg_path)
         .map_err(|e| format!("Failed to create package directory: {}", e))?;
 
+    let lym_config_url = format!(
+        "https://api.github.com/repos/{}/contents/{}/@{}/lym.json",
+        repo_slug, package_name, chosen_version
+    );
+    
+    let mut lym_config = LymConfig::default();
+
+    if let Ok(lym_resp) = client.get(&lym_config_url).send() {
+        if lym_resp.status().is_success() {
+            if let Ok(lym_json) = lym_resp.json::<JsonValue>() {
+                if let Some(encoded_content) = lym_json.get("content").and_then(JsonValue::as_str) {
+                    let content = encoded_content.replace('\n', "");
+                    if let Ok(decoded_bytes) = general_purpose::STANDARD.decode(&content) {
+                        if let Ok(config_str) = String::from_utf8(decoded_bytes) {
+                            if let Ok(config_json) = serde_json::from_str::<JsonValue>(&config_str) {
+                                if verbose {
+                                    println!("{}", "Found lym.json configuration".bright_cyan());
+                                }
+                                
+                                if let Some(ignore) = config_json.get("ignore").and_then(JsonValue::as_array) {
+                                    lym_config.ignore = ignore.iter()
+                                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                        .collect();
+                                }
+                                
+                                if let Some(platforms) = config_json.get("supported_platforms").and_then(JsonValue::as_array) {
+                                    lym_config.supported_platforms = platforms.iter()
+                                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                        .collect();
+                                }
+                                
+                                if let Some(platform_ignore) = config_json.get("platform_ignore").and_then(JsonValue::as_object) {
+                                    for (platform, patterns) in platform_ignore {
+                                        if let Some(pattern_arr) = patterns.as_array() {
+                                            lym_config.platform_ignore.insert(
+                                                platform.clone(),
+                                                pattern_arr.iter()
+                                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                                    .collect()
+                                            );
+                                        }
+                                    }
+                                }
+                                
+                                if let Some(scripts) = config_json.get("scripts").and_then(JsonValue::as_object) {
+                                    for (script_name, script_path) in scripts {
+                                        if let Some(path) = script_path.as_str() {
+                                            lym_config.scripts.insert(script_name.clone(), path.to_string());
+                                        }
+                                    }
+                                }
+                                
+                                if let Some(options) = config_json.get("options").and_then(JsonValue::as_object) {
+                                    if let Some(overwrite) = options.get("overwrite_existing").and_then(JsonValue::as_bool) {
+                                        lym_config.overwrite_existing = overwrite;
+                                    }
+                                    if let Some(update_fresh) = options.get("update_fresh").and_then(JsonValue::as_bool) {
+                                        lym_config.update_fresh = update_fresh;
+                                    }
+                                }
+                                
+                                if let Some(ignore_hashes) = config_json.get("ignore_hashes").and_then(JsonValue::as_object) {
+                                    for (path_or_hash, hash) in ignore_hashes {
+                                        if let Some(hash_str) = hash.as_str() {
+                                            lym_config.ignore_hashes.insert(path_or_hash.clone(), hash_str.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let current_platform = get_current_platform();
+    
+    let all_platforms = vec!["windows".to_string(), "linux".to_string(), "macos".to_string(), "freebsd".to_string()];
+    let is_all_specified = target_platforms.len() == 4 && 
+        all_platforms.iter().all(|p| target_platforms.contains(p));
+    
+    let mut platforms_to_check = if target_platforms.is_empty() {
+        vec![current_platform.to_string()]
+    } else {
+        target_platforms.to_vec()
+    };
+    
+    if !lym_config.supported_platforms.contains(&current_platform.to_string()) {
+        return Err(format!(
+            "Package '{}' does not support current platform '{}'. Supported platforms: {:?}",
+            package_name, current_platform, lym_config.supported_platforms
+        ));
+    }
+    
+    if is_all_specified {
+        let mut filtered_platforms = Vec::new();
+        
+        for platform in &platforms_to_check {
+            if lym_config.supported_platforms.contains(platform) {
+                filtered_platforms.push(platform.clone());
+            } else if verbose {
+                println!("{}", format!("Skipping unsupported platform: {}", platform).yellow());
+            }
+        }
+        
+        platforms_to_check = filtered_platforms;
+        
+        if platforms_to_check.is_empty() {
+            return Err(format!(
+                "Package '{}' does not support any of the requested platforms. Supported platforms: {}",
+                package_name, lym_config.supported_platforms.join(", ")
+            ));
+        }
+    } else {
+        for platform in &platforms_to_check {
+            if !lym_config.supported_platforms.contains(platform) {
+                return Err(format!(
+                    "Package '{}' does not support platform '{}'. Supported platforms: {}",
+                    package_name, platform, lym_config.supported_platforms.join(", ")
+                ));
+            }
+        }
+    }
+    
+    if verbose && !target_platforms.is_empty() {
+        if platforms_to_check.len() == 1 {
+            println!("{}", format!("Installing for target platform: {}", platforms_to_check[0]).bright_cyan());
+        } else {
+            println!("{}", format!("Installing for target platforms: {}", platforms_to_check.join(", ")).bright_cyan());
+        }
+    }
+
+    if lym_config.update_fresh && local_pkg_path.exists() {
+        if verbose {
+            println!("{}", "Fresh install enabled - cleaning package directory".bright_yellow());
+        }
+        fs::remove_dir_all(&local_pkg_path)
+            .map_err(|e| format!("Failed to clean package directory for fresh install: {}", e))?;
+        fs::create_dir_all(&local_pkg_path)
+            .map_err(|e| format!("Failed to recreate package directory: {}", e))?;
+    }
+
     let manifest_url = format!(
         "https://api.github.com/repos/{}/contents/{}/@{}/manifest.json",
-        repo_slug, pkg_name, chosen_version
+        repo_slug, package_name, chosen_version
     );
     let fetch_pb = ProgressBar::new_spinner();
     fetch_pb.set_message("Fetching manifest.json...");
@@ -685,7 +1099,7 @@ fn install_single_package(
     if !check_version(current_version, required_version) {
         eprintln!("{}", format!(
             "Warning: Package '{}' requires lucia version '{}', but current version is '{}'",
-            pkg_name, required_version, current_version
+            package_name, required_version, current_version
         ).yellow());
 
         if !no_confirm {
@@ -735,6 +1149,8 @@ fn install_single_package(
             }
 
             if install_each || install_all {
+                let mut deps_to_install = Vec::new();
+                
                 for (dep_name, dep_version_val) in deps {
                     let dep_version = dep_version_val.as_str().unwrap_or("*");
                     let dep_path = libs_dir.join(dep_name);
@@ -782,90 +1198,297 @@ fn install_single_package(
                                     continue;
                                 }
                             } else {
-                                println!("{}", format!("Dependency '{}' already at version '{}', proceeding with download due to no_confirm", dep_name, inst_ver).bright_yellow());
+                                println!("{}", format!("Dependency '{}' already at version '{}', proceeding with download due to no-confirm", dep_name, inst_ver).bright_yellow());
                             }
                         }
                         fs::remove_dir_all(&dep_path).ok();
                     }
-
-                    install_single_package(dep_name, no_confirm, verbose, None)?;
+                    
+                    deps_to_install.push(dep_name.clone());
+                }
+                
+                if !deps_to_install.is_empty() {
+                    let runtime = tokio::runtime::Runtime::new()
+                        .map_err(|e| format!("Failed to create async runtime for dependencies: {}", e))?;
+                    
+                    runtime.block_on(async {
+                        use futures::stream::{FuturesUnordered, StreamExt};
+                        let mut stream = FuturesUnordered::new();
+                        let mut dep_tasks = deps_to_install.into_iter();
+                        
+                        for _ in 0..std::cmp::min(3, dep_tasks.len()) {
+                            if let Some(dep_name) = dep_tasks.next() {
+                                let platforms_clone = platforms_to_check.clone();
+                                stream.push(tokio::task::spawn_blocking(move || {
+                                    install_single_package(&dep_name, no_confirm, verbose, None, &platforms_clone)
+                                }));
+                            }
+                        }
+                        
+                        while let Some(result) = stream.next().await {
+                            match result {
+                                Ok(install_result) => {
+                                    if let Err(e) = install_result {
+                                        return Err(e);
+                                    }
+                                },
+                                Err(e) => return Err(format!("Dependency installation task failed: {}", e)),
+                            }
+                            
+                            if let Some(dep_name) = dep_tasks.next() {
+                                let platforms_clone = platforms_to_check.clone();
+                                stream.push(tokio::task::spawn_blocking(move || {
+                                    install_single_package(&dep_name, no_confirm, verbose, None, &platforms_clone)
+                                }));
+                            }
+                        }
+                        
+                        Ok::<(), String>(())
+                    })?;
                 }
             }
         }
     }
 
-    fn download_dir_recursive(
+    let mut all_ignore_patterns = lym_config.ignore.clone();
+    
+    if is_all_specified {
+        if verbose {
+            println!("{}", "Targeting all platforms - skipping platform-specific ignore patterns".bright_cyan());
+        }
+    } else {
+        for platform in &platforms_to_check {
+            if let Some(platform_patterns) = lym_config.platform_ignore.get(platform) {
+                all_ignore_patterns.extend(platform_patterns.clone());
+            }
+        }
+    }
+
+    fn should_download_file(
+        relative_path: &str, 
+        ignore_patterns: &[String],
+        local_file_path: &Path,
+        remote_sha: &str,
+        overwrite_existing: bool,
+        ignore_hashes: &HashMap<String, String>
+    ) -> bool {
+        if should_ignore_file(relative_path, ignore_patterns) {
+            return false;
+        }
+
+        if ignore_hashes.contains_key(remote_sha) {
+            return false;
+        }
+
+        if let Some(ignored_hash) = ignore_hashes.get(relative_path) {
+            if ignored_hash == remote_sha {
+                return false;
+            }
+        }
+
+        if !overwrite_existing && local_file_path.exists() {
+            if let Ok(local_hash) = git_blob_hash(local_file_path) {
+                if local_hash == remote_sha {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    fn collect_files_to_download(
         client: &Client,
         repo_slug: &str,
         remote_path: &str,
-        local_path: &Path,
-        verbose: bool,
-        pb: &ProgressBar,
-    ) -> Result<(), String> {
-        let contents: Vec<JsonValue> = client.get(&format!("https://api.github.com/repos/{}/contents/{}", repo_slug, remote_path))
-            .send()
-            .map_err(|e| format!("Failed to fetch '{}': {}", remote_path, e))?
-            .json()
-            .map_err(|e| format!("Failed to parse JSON for '{}': {}", remote_path, e))?;
+        local_base_path: &Path,
+        package_root: &str,
+        ignore_patterns: &[String],
+        overwrite_existing: bool,
+        ignore_hashes: &HashMap<String, String>,
+    ) -> Result<Vec<(String, String, PathBuf, String, u64)>, String> {
+        let mut files_to_download = Vec::new();
+        let mut stack = vec![(remote_path.to_string(), local_base_path.to_path_buf())];
 
-        for item in contents {
-            let name = item.get("name").and_then(JsonValue::as_str).ok_or("Missing name")?;
-            let item_type = item.get("type").and_then(JsonValue::as_str).unwrap_or("");
-            let local_item_path = local_path.join(name);
+        while let Some((current_remote_path, current_local_path)) = stack.pop() {
+            let items: Vec<JsonValue> = client
+                .get(&format!("https://api.github.com/repos/{}/contents/{}", repo_slug, current_remote_path))
+                .send()
+                .map_err(|e| format!("Failed to fetch '{}': {}", current_remote_path, e))?
+                .json()
+                .map_err(|e| format!("Failed to parse JSON for '{}': {}", current_remote_path, e))?;
 
-            if item_type == "file" {
-                let download_url = item.get("download_url").and_then(JsonValue::as_str)
-                    .ok_or_else(|| format!("File '{}' missing download_url", name))?;
-                if verbose { pb.set_message(format!("Downloading {}", name)); }
+            for item in items {
+                let name = item.get("name").and_then(JsonValue::as_str).ok_or("Missing name")?;
+                let item_type = item.get("type").and_then(JsonValue::as_str).unwrap_or("");
+                let local_item_path = current_local_path.join(name);
 
-                let mut resp = client.get(download_url)
-                    .send()
-                    .map_err(|e| format!("Failed to download '{}': {}", name, e))?;
+                let relative_path = if current_remote_path == package_root {
+                    format!("./{}", name)
+                } else {
+                    let relative_dir = current_remote_path.strip_prefix(&format!("{}/", package_root))
+                        .unwrap_or(current_remote_path.strip_prefix(package_root).unwrap_or(""));
+                    if relative_dir.is_empty() {
+                        format!("./{}", name)
+                    } else {
+                        format!("{}/{}", relative_dir, name)
+                    }
+                };
 
-                if !resp.status().is_success() {
-                    eprintln!("{}", format!("Failed to download file {}: HTTP {}", name, resp.status()).red());
-                    continue;
+                if item_type == "file" {
+                    let sha = item.get("sha").and_then(JsonValue::as_str).unwrap_or("");
+                    let download_url = item.get("download_url").and_then(JsonValue::as_str)
+                        .ok_or_else(|| format!("File '{}' missing download_url", name))?;
+                    let size = item.get("size").and_then(JsonValue::as_u64).unwrap_or(0);
+
+                    if should_download_file(&relative_path, ignore_patterns, &local_item_path, sha, overwrite_existing, ignore_hashes) {
+                        files_to_download.push((
+                            download_url.to_string(),
+                            relative_path,
+                            local_item_path,
+                            sha.to_string(),
+                            size
+                        ));
+                    }
+                } else if item_type == "dir" {
+                    stack.push((format!("{}/{}", current_remote_path, name), local_item_path));
                 }
-
-                let mut file = std::fs::File::create(&local_item_path)
-                    .map_err(|e| format!("Failed to create '{}': {}", local_item_path.display(), e))?;
-                resp.copy_to(&mut file).map_err(|e| format!("Failed to write '{}': {}", local_item_path.display(), e))?;
-            } else if item_type == "dir" {
-                std::fs::create_dir_all(&local_item_path)
-                    .map_err(|e| format!("Failed to create directory '{}': {}", local_item_path.display(), e))?;
-                download_dir_recursive(client, repo_slug, &format!("{}/{}", remote_path, name), &local_item_path, verbose, pb)?;
             }
-            pb.inc(1);
+        }
+
+        Ok(files_to_download)
+    }
+
+    let api_url = format!("{}/@{}", package_name, chosen_version);
+    
+    let lucia_executable = Path::new(
+        config_json.get("lucia_path")
+            .and_then(JsonValue::as_str)
+            .ok_or("Lucia path not set in config. Cannot run scripts.")?
+    );
+
+    let execute_script = |script_name: &str, script_file: &str| -> Result<(), String> {
+        let script_path = local_pkg_path.join(script_file);
+        if !script_path.exists() {
+            if verbose {
+                println!("{}", format!("Script '{}' not found at {}", script_name, script_path.display()).yellow());
+            }
+            return Ok(());
+        }
+
+        if verbose {
+            println!("{}", format!("Running {} script: {}", script_name, script_file).bright_cyan());
+        }
+
+        let original_dir = std::env::current_dir()
+            .map_err(|e| format!("Failed to get current directory: {}", e))?;
+
+        std::env::set_current_dir(&local_pkg_path)
+            .map_err(|e| format!("Failed to change to package directory: {}", e))?;
+
+        let output = Command::new(&lucia_executable)
+            .arg(&script_file)
+            .output()
+            .map_err(|e| format!("Failed to execute {} script: {}", script_name, e))?;
+
+        std::env::set_current_dir(&original_dir)
+            .map_err(|e| format!("Failed to restore original directory: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let exit_code = output.status.code().unwrap_or(-1);
+            
+            if script_name == "test" {
+                return Err(format!("{} script failed with exit code {}: {}", 
+                    script_name, exit_code, stderr));
+            } else {
+                eprintln!("{}", format!("Warning: {} script failed with exit code {}: {}", 
+                    script_name, exit_code, stderr).yellow());
+                if verbose {
+                    println!("{}", format!("{} script failed but continuing installation", script_name).yellow());
+                }
+                return Ok(());
+            }
+        }
+
+        if verbose {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if !stdout.trim().is_empty() {
+                println!("{} output: {}", script_name, stdout.trim());
+            }
+            println!("{}", format!("{} script completed successfully", script_name).bright_green());
         }
 
         Ok(())
+    };
+
+    let all_files_to_download = collect_files_to_download(
+        &client,
+        repo_slug,
+        &api_url,
+        &local_pkg_path,
+        &api_url,
+        &all_ignore_patterns,
+        lym_config.overwrite_existing,
+        &lym_config.ignore_hashes,
+    )?;
+
+    let script_names: Vec<String> = lym_config.scripts.values().cloned().collect();
+    let mut script_files = Vec::new();
+    let mut other_files = Vec::new();
+
+    for file_info in all_files_to_download {
+        let (download_url, relative_path, local_file_path, sha, size) = file_info;
+        let filename = Path::new(&relative_path).file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+            
+        if script_names.iter().any(|script| script == filename || relative_path.ends_with(script)) {
+            script_files.push((download_url, relative_path, local_file_path, sha, size));
+        } else {
+            other_files.push((download_url, relative_path, local_file_path, sha, size));
+        }
     }
 
-    let api_url = format!("{}/@{}", pkg_name, chosen_version);
-    // let resp = client.get(&format!("https://api.github.com/repos/{}/contents/{}", repo_slug, api_url))
-    //     .send()
-    //     .map_err(|e| format!("Failed to fetch package files: {}", e))?
-    //     .json::<Vec<JsonValue>>()
-    //     .map_err(|e| format!("Failed to parse remote package directory listing: {}", e))?;
-
-    let mut total_files = 0;
-    let mut stack = vec![format!("{}/@{}", pkg_name, chosen_version)];
-
-    while let Some(remote_path) = stack.pop() {
-        let items: Vec<JsonValue> = client.get(&format!("https://api.github.com/repos/{}/contents/{}", repo_slug, remote_path))
-            .send()
-            .map_err(|e| format!("Failed to fetch '{}': {}", remote_path, e))?
-            .json()
-            .map_err(|e| format!("Failed to parse JSON for '{}': {}", remote_path, e))?;
-
-        for item in items {
-            let item_type = item.get("type").and_then(JsonValue::as_str).unwrap_or("");
-            let name = item.get("name").and_then(JsonValue::as_str).ok_or("Missing name")?;
-            if item_type == "file" {
-                total_files += 1;
-            } else if item_type == "dir" {
-                stack.push(format!("{}/{}", remote_path, name));
+    if !script_files.is_empty() {
+        if verbose {
+            println!("{}", "Downloading script files...".bright_cyan());
+        }
+        
+        if !script_files.is_empty() {
+            if verbose {
+                println!("{}", format!("Downloading {} script files...", script_files.len()).cyan());
             }
+            let script_pb = ProgressBar::new(script_files.len() as u64);
+            script_pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+                    .unwrap()
+                    .progress_chars("#>-"),
+            );
+            
+            let runtime = tokio::runtime::Runtime::new()
+                .map_err(|e| format!("Failed to create async runtime for scripts: {}", e))?;
+            
+            runtime.block_on(async {
+                download_files_async(&client, script_files, &script_pb).await
+            })?;
+            
+            script_pb.finish_with_message("Script download complete");
+        }
+    }
+
+    if let Some(pre_install_script) = lym_config.scripts.get("pre_install") {
+        let _ = execute_script("pre-install", pre_install_script);
+    }
+
+    let files_to_download = other_files;
+
+    let total_files = files_to_download.len() as u64;
+    if verbose {
+        println!("{}", format!("Found {} files to download", total_files).bright_cyan());
+        if !all_ignore_patterns.is_empty() {
+            println!("{}", format!("Ignoring patterns: {:?}", all_ignore_patterns).yellow());
         }
     }
 
@@ -876,11 +1499,26 @@ fn install_single_package(
             .unwrap()
             .progress_chars("#>-"),
     );
+    pb.set_message("Starting downloads...");
 
-    download_dir_recursive(&client, repo_slug, &api_url, &local_pkg_path, verbose, &pb)?;
-    pb.finish_with_message("Download complete");
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("Failed to create async runtime: {}", e))?;
+    
+    runtime.block_on(async {
+        download_files_async(&client, files_to_download, &pb).await
+    })?;
 
-    println!("{}", format!("Package '{}@{}' installed successfully.", pkg_name, chosen_version).bright_green());
+    pb.finish_with_message("All downloads completed");
+
+    if let Some(post_install_script) = lym_config.scripts.get("post_install") {
+        execute_script("post-install", post_install_script)?;
+    }
+
+    if let Some(test_script) = lym_config.scripts.get("test") {
+        execute_script("test", test_script)?;
+    }
+
+    println!("{}", format!("Package '{}@{}' installed successfully.", package_name, chosen_version).bright_green());
 
     Ok(())
 }
@@ -1046,21 +1684,14 @@ fn move_packages(args: &[String], disable: bool) {
 fn install(args: &[String]) {
     let mut no_confirm = false;
     let mut verbose = false;
+    let mut target_platforms = Vec::new();
 
     let mut packages = Vec::new();
-    let mut flags = Vec::new();
-
-    let mut flag_mode = false;
-    for arg in args {
-        if flag_mode || arg.starts_with('-') {
-            flag_mode = true;
-            flags.push(arg.clone());
-        } else {
-            packages.push(arg.clone());
-        }
-    }
-
-    for arg in &flags {
+    let mut i = 0;
+    
+    while i < args.len() {
+        let arg = &args[i];
+        
         match arg.as_str() {
             "--no-confirm" => no_confirm = true,
             "-v" => verbose = true,
@@ -1068,12 +1699,57 @@ fn install(args: &[String]) {
                 command_help("install");
                 return;
             }
-            _ => {
+            "--target" => {
+                if i + 1 < args.len() {
+                    i += 1;
+                    let platform = &args[i];
+                    if platform == "all" {
+                        target_platforms.extend_from_slice(&["windows".to_string(), "linux".to_string(), "macos".to_string(), "freebsd".to_string()]);
+                    } else {
+                        target_platforms.push(platform.clone());
+                    }
+                } else {
+                    eprintln!("{}", "Error: --target requires a platform argument".red());
+                    command_help("install");
+                    return;
+                }
+            }
+            arg if arg.starts_with("-t") => {
+                if arg == "-t" {
+                    if i + 1 < args.len() {
+                        i += 1;
+                        let platform = &args[i];
+                        if platform == "all" {
+                            target_platforms.extend_from_slice(&["windows".to_string(), "linux".to_string(), "macos".to_string(), "freebsd".to_string()]);
+                        } else {
+                            target_platforms.push(platform.clone());
+                        }
+                    } else {
+                        eprintln!("{}", "Error: -t requires a platform argument".red());
+                        command_help("install");
+                        return;
+                    }
+                } else {
+                    let platform = &arg[2..];
+                    if platform == "all" {
+                        target_platforms.extend_from_slice(&["windows".to_string(), "linux".to_string(), "macos".to_string(), "freebsd".to_string()]);
+                    } else if !platform.is_empty() {
+                        target_platforms.push(platform.to_string());
+                    } else {
+                        eprintln!("{}", "Error: -t requires a platform argument".red());
+                        command_help("install");
+                        return;
+                    }
+                }
+            }
+            arg if arg.starts_with('-') => {
                 eprintln!("{}", format!("Unknown argument: '{}'", arg).red());
                 command_help("install");
                 return;
             }
+            _ => packages.push(arg.clone()),
         }
+        i += 1;
     }
 
     if packages.is_empty() {
@@ -1087,10 +1763,277 @@ fn install(args: &[String]) {
             println!("Installing package '{}'", pkg_name.bright_cyan());
         }
 
-        if let Err(e) = install_single_package(&pkg_name, no_confirm, verbose, None) {
+        if let Err(e) = install_single_package(&pkg_name, no_confirm, verbose, None, &target_platforms) {
             eprintln!("{}", format!("Failed to install '{}': {}", pkg_name, e).red());
         }
     }
+}
+
+async fn list_remote_packages_async(repo_slug: &str, module_name_filter: &Option<String>, show_desc: bool, show_ver: bool, show_info_all: bool) {
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static("lym-list"));
+    if let Some((username, token)) = get_lym_auth() {
+        let auth_val = general_purpose::STANDARD.encode(format!("{}:{}", username, token));
+        if let Ok(auth_header) = HeaderValue::from_str(&format!("Basic {}", auth_val)) {
+            headers.insert(AUTHORIZATION, auth_header);
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(10)
+        .tcp_keepalive(Duration::from_secs(60))
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("{}", format!("Failed to build HTTP client: {}", e).red());
+            exit(1);
+        });
+
+    let api_url = format!("https://api.github.com/repos/{}/contents/", repo_slug);
+    
+    let resp = match client.get(&api_url).send().await {
+        Ok(resp) if resp.status().is_success() => resp,
+        Ok(resp) => {
+            eprintln!("{}", format!("GitHub API error: HTTP {}", resp.status()).red());
+            return;
+        },
+        Err(e) => {
+            eprintln!("{}", format!("Failed to fetch package list: {}", e).red());
+            return;
+        }
+    };
+
+    let contents: Vec<JsonValue> = match resp.json().await {
+        Ok(contents) => contents,
+        Err(_) => {
+            eprintln!("{}", "Failed to parse GitHub API response.".red());
+            return;
+        }
+    };
+
+    println!("{}", "Remote modules:".bright_green().bold());
+
+    let mut package_names = Vec::new();
+    for item in contents.iter() {
+        let name = item.get("name").and_then(JsonValue::as_str).unwrap_or("");
+        let item_type = item.get("type").and_then(JsonValue::as_str).unwrap_or("");
+        
+        if item_type != "dir" { continue; }
+        if let Some(filter) = &module_name_filter {
+            if name != filter { continue; }
+        }
+        
+        package_names.push(name.to_string());
+    }
+
+    if package_names.is_empty() {
+        return;
+    }
+
+    use futures::stream::{FuturesUnordered, StreamExt};
+    let mut stream = FuturesUnordered::new();
+    let mut pkg_iter = package_names.into_iter();
+
+    for _ in 0..std::cmp::min(6, pkg_iter.len()) {
+        if let Some(pkg_name) = pkg_iter.next() {
+            let client_clone = client.clone();
+            let repo_slug_clone = repo_slug.to_string();
+            let filter_clone = module_name_filter.clone();
+            
+            stream.push(tokio::spawn(async move {
+                process_remote_package_async(&client_clone, &repo_slug_clone, &pkg_name, &filter_clone, show_desc, show_ver, show_info_all).await
+            }));
+        }
+    }
+
+    while let Some(result) = stream.next().await {
+        if let Ok(package_info) = result {
+            if let Some(info) = package_info {
+                println!("{}", info);
+            }
+        }
+
+        if let Some(pkg_name) = pkg_iter.next() {
+            let client_clone = client.clone();
+            let repo_slug_clone = repo_slug.to_string();
+            let filter_clone = module_name_filter.clone();
+            
+            stream.push(tokio::spawn(async move {
+                process_remote_package_async(&client_clone, &repo_slug_clone, &pkg_name, &filter_clone, show_desc, show_ver, show_info_all).await
+            }));
+        }
+    }
+}
+
+async fn process_remote_package_async(
+    client: &reqwest::Client, 
+    repo_slug: &str, 
+    pkg_name: &str,
+    module_name_filter: &Option<String>,
+    show_desc: bool,
+    show_ver: bool,
+    show_info_all: bool
+) -> Option<String> {
+    let versions_url = format!("https://api.github.com/repos/{}/contents/{}", repo_slug, pkg_name);
+    
+    let versions_resp = match client.get(&versions_url).send().await {
+        Ok(resp) if resp.status().is_success() => resp,
+        _ => return None,
+    };
+
+    let version_dirs: Vec<JsonValue> = versions_resp.json().await.unwrap_or_default();
+    let mut latest_version: Option<String> = None;
+    let mut all_versions = vec![];
+
+    for vdir in version_dirs.iter() {
+        let vname = vdir.get("name").and_then(JsonValue::as_str).unwrap_or("");
+        if !vname.starts_with('@') { continue; }
+        let ver = &vname[1..];
+        all_versions.push(ver.to_string());
+        
+        if let Some(lat) = &latest_version {
+            if cmp_version(lat, ver) == Some(std::cmp::Ordering::Less) {
+                latest_version = Some(ver.to_string());
+            }
+        } else { 
+            latest_version = Some(ver.to_string()); 
+        }
+    }
+
+    let latest_ver = latest_version?;
+
+    if module_name_filter.is_some() || show_info_all {
+        let manifest_url = format!(
+            "https://api.github.com/repos/{}/contents/{}/@{}/manifest.json",
+            repo_slug, pkg_name, latest_ver
+        );
+
+        if let Ok(manifest_resp) = client.get(&manifest_url).send().await {
+            if let Ok(manifest_json) = manifest_resp.json::<JsonValue>().await {
+                if let Some(content_encoded) = manifest_json.get("content").and_then(JsonValue::as_str) {
+                    if let Ok(decoded_bytes) = general_purpose::STANDARD.decode(content_encoded.replace('\n', "")) {
+                        if let Ok(decoded_str) = String::from_utf8(decoded_bytes) {
+                            if let Ok(manifest) = serde_json::from_str::<JsonValue>(&decoded_str) {
+                                let authors = manifest.get("authors")
+                                    .and_then(JsonValue::as_array)
+                                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect::<Vec<_>>())
+                                    .unwrap_or_default();
+
+                                let author_str = if authors.is_empty() { 
+                                    "unknown".to_string() 
+                                } else {
+                                    authors.iter().map(|a| a.yellow().to_string()).collect::<Vec<_>>().join(", ")
+                                };
+
+                                println!("{} - {}", pkg_name.bright_cyan(), author_str);
+                                
+                                let versions_to_show = if all_versions.len() <= 5 {
+                                    all_versions.clone()
+                                } else {
+                                    all_versions[all_versions.len()-5..].to_vec()
+                                };
+                                
+                                use futures::stream::{FuturesUnordered, StreamExt};
+                                let mut version_tasks = FuturesUnordered::new();
+                                
+                                for ver in &versions_to_show {
+                                    let ver_manifest_url = format!(
+                                        "https://api.github.com/repos/{}/contents/{}/@{}/manifest.json",
+                                        repo_slug, pkg_name, ver
+                                    );
+                                    let client_clone = client.clone();
+                                    let ver_clone = ver.clone();
+                                    let latest_ver_clone = latest_ver.clone();
+                                    
+                                    version_tasks.push(async move {
+                                        if let Ok(ver_resp) = client_clone.get(&ver_manifest_url).send().await {
+                                            if let Ok(ver_json) = ver_resp.json::<JsonValue>().await {
+                                                if let Some(ver_content) = ver_json.get("content").and_then(JsonValue::as_str) {
+                                                    if let Ok(ver_decoded) = general_purpose::STANDARD.decode(ver_content.replace('\n', "")) {
+                                                        if let Ok(ver_decoded_str) = String::from_utf8(ver_decoded) {
+                                                            if let Ok(ver_manifest) = serde_json::from_str::<JsonValue>(&ver_decoded_str) {
+                                                                let desc = ver_manifest.get("description").and_then(JsonValue::as_str).unwrap_or("");
+                                                                let mut result = format!("   {} - {}", format!("v{}", ver_clone).green(), desc);
+                                                                
+                                                                if ver_clone == latest_ver_clone {
+                                                                    if let Some(deps_obj) = ver_manifest.get("dependencies").and_then(JsonValue::as_object) {
+                                                                        if !deps_obj.is_empty() {
+                                                                            result += "\n   Dependencies:";
+                                                                            for (dep_name, dep_version) in deps_obj {
+                                                                                if let Some(dep_ver_str) = dep_version.as_str() {
+                                                                                    result += &format!("\n     {} {}", dep_name.bright_magenta(), dep_ver_str.green());
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                                return Some((ver_clone, result));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        None
+                                    });
+                                }
+                                
+                                let mut version_results = Vec::new();
+                                while let Some(result) = version_tasks.next().await {
+                                    if let Some((ver, output)) = result {
+                                        version_results.push((ver, output));
+                                    }
+                                }
+                                
+                                version_results.sort_by(|a, b| {
+                                    cmp_version(&b.0, &a.0).unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                                
+                                for (_, output) in version_results {
+                                    println!("{}", output);
+                                }
+                                
+                                return Some(String::new());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut line = format!("  {}", pkg_name.bright_cyan());
+    if show_ver {
+        line += &format!(" v{}", latest_ver);
+    }
+    
+    if show_desc {
+        let manifest_url = format!(
+            "https://api.github.com/repos/{}/contents/{}/@{}/manifest.json",
+            repo_slug, pkg_name, latest_ver
+        );
+
+        if let Ok(manifest_resp) = client.get(&manifest_url).send().await {
+            if let Ok(manifest_json) = manifest_resp.json::<JsonValue>().await {
+                if let Some(content_encoded) = manifest_json.get("content").and_then(JsonValue::as_str) {
+                    if let Ok(decoded_bytes) = general_purpose::STANDARD.decode(content_encoded.replace('\n', "")) {
+                        if let Ok(decoded_str) = String::from_utf8(decoded_bytes) {
+                            if let Ok(manifest) = serde_json::from_str::<JsonValue>(&decoded_str) {
+                                if let Some(desc) = manifest.get("description").and_then(JsonValue::as_str) {
+                                    if !desc.is_empty() {
+                                        line += &format!(" - {}", desc);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Some(line)
 }
 
 fn list(args: &[String]) {
@@ -1100,7 +2043,8 @@ fn list(args: &[String]) {
     let mut list_local = true;
     let mut list_store = false;
     let mut show_std = true;
-    let mut module_name_filter: Option<String> = None; // new arg support
+    let mut show_info_all = false;
+    let mut module_name_filter: Option<String> = None;
 
     for arg in args {
         match arg.as_str() {
@@ -1109,8 +2053,13 @@ fn list(args: &[String]) {
                 list_local = false;
                 list_store = false;
             }
-            "--no-desc" => show_desc = false,
+            "--no-desc" | "-u" | "--ultra-fast" => show_desc = false,
             "--no-ver" => show_ver = false,
+            "--info-all" | "-i" => {
+                show_info_all = true;
+                show_desc = true;
+                show_ver = true;
+            },
             "--local" => {
                 list_local = true;
                 list_remote = false;
@@ -1132,7 +2081,7 @@ fn list(args: &[String]) {
                     command_help("list");
                     return;
                 } else {
-                    module_name_filter = Some(arg.clone()); // treat as module name
+                    module_name_filter = Some(arg.clone());
                 }
             }
         }
@@ -1188,15 +2137,30 @@ fn list(args: &[String]) {
                     if manifest_path.exists() {
                         if let Ok(manifest_str) = fs::read_to_string(&manifest_path) {
                             if let Ok(manifest_json) = serde_json::from_str::<JsonValue>(&manifest_str) {
-                                if !show_all_versions {
-                                    versions.push(manifest_json.get("version").and_then(JsonValue::as_str).unwrap_or("unknown").to_string());
-                                    description = manifest_json.get("description").and_then(JsonValue::as_str).map(|s| s.to_string());
-                                } else {
-                                    // list all versions locally
-                                    if let Ok(version_entries) = fs::read_dir(&path) {
-                                        for ve in version_entries.flatten() {
-                                            let ver_name = ve.file_name().to_string_lossy().to_string();
-                                            versions.push(ver_name);
+                                let current_version = manifest_json.get("version").and_then(JsonValue::as_str).unwrap_or("unknown").to_string();
+                                versions.push(current_version);
+                                description = manifest_json.get("description").and_then(JsonValue::as_str).map(|s| s.to_string());
+                                
+                                if show_all_versions {
+                                    if let Some(authors_array) = manifest_json.get("authors").and_then(JsonValue::as_array) {
+                                        let authors: Vec<String> = authors_array.iter()
+                                            .filter_map(|v| v.as_str())
+                                            .map(|s| s.to_string())
+                                            .collect();
+                                        if !authors.is_empty() {
+                                            let author_str = authors.iter().map(|a| a.yellow().to_string()).collect::<Vec<_>>().join(", ");
+                                            println!("   Authors: {}", author_str);
+                                        }
+                                    }
+                                    
+                                    if let Some(deps_obj) = manifest_json.get("dependencies").and_then(JsonValue::as_object) {
+                                        if !deps_obj.is_empty() {
+                                            println!("   Dependencies:");
+                                            for (dep_name, dep_version) in deps_obj {
+                                                if let Some(ver_str) = dep_version.as_str() {
+                                                    println!("     {} {}", dep_name.bright_magenta(), ver_str.green());
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1256,7 +2220,7 @@ fn list(args: &[String]) {
         }
 
         println!("{}", "Local modules:".bright_green().bold());
-        process_modules(&libs_dir, show_std, module_name_filter.is_some());
+        process_modules(&libs_dir, show_std, module_name_filter.is_some() || show_info_all);
     }
 
     if list_store {
@@ -1267,7 +2231,7 @@ fn list(args: &[String]) {
         }
 
         println!("{}", "Stored modules:".bright_green().bold());
-        process_modules(&store_dir, show_std, module_name_filter.is_some());
+        process_modules(&store_dir, show_std, module_name_filter.is_some() || show_info_all);
     }
 
     if list_remote {
@@ -1278,171 +2242,14 @@ fn list(args: &[String]) {
         }
         let repo_slug = repo_slug.unwrap();
 
-        let mut headers = HeaderMap::new();
-        headers.insert(USER_AGENT, HeaderValue::from_static("lym-list"));
-        if let Some((username, token)) = get_lym_auth() {
-            let auth_val = general_purpose::STANDARD.encode(format!("{}:{}", username, token));
-            headers.insert(AUTHORIZATION, HeaderValue::from_str(&format!("Basic {}", auth_val)).unwrap());
-        }
-
-        let client = Client::builder()
-            .default_headers(headers)
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_else(|e| {
-                eprintln!("{}", format!("Failed to build HTTP client: {}", e).red());
-                exit(1);
-            });
-
-        let api_url = format!("https://api.github.com/repos/{}/contents/", repo_slug);
-        let resp = client.get(&api_url).send();
-
-        if let Ok(resp) = resp {
-            if resp.status().is_success() {
-                let contents: Vec<JsonValue> = resp.json().unwrap_or_else(|_| {
-                    eprintln!("{}", "Failed to parse GitHub API response.".red());
-                    exit(1);
-                });
-
-                println!("{}", "Remote modules:".bright_green().bold());
-                let mut found_any = false;
-
-                for item in contents.iter() {
-                    let name = item.get("name").and_then(JsonValue::as_str).unwrap_or("");
-                    let item_type = item.get("type").and_then(JsonValue::as_str).unwrap_or("");
-                    if item_type != "dir" { continue; }
-                    if let Some(ref filter) = module_name_filter {
-                        if name != filter { continue; }
-                    }
-                    found_any = true;
-
-                    let versions_url = format!("https://api.github.com/repos/{}/contents/{}", repo_slug, name);
-                    let versions_resp = client.get(&versions_url).send();
-                    if let Ok(versions_resp) = versions_resp {
-                        if versions_resp.status().is_success() {
-                            let version_dirs: Vec<JsonValue> = versions_resp.json().unwrap_or_default();
-                            let mut latest_version: Option<String> = None;
-                            let mut all_versions = vec![];
-
-                            for vdir in version_dirs.iter() {
-                                let vname = vdir.get("name").and_then(JsonValue::as_str).unwrap_or("");
-                                if !vname.starts_with('@') { continue; }
-                                let ver = &vname[1..];
-                                all_versions.push(ver.to_string());
-                                if let Some(lat) = &latest_version {
-                                    if cmp_version(lat, ver) == Some(std::cmp::Ordering::Less) {
-                                        latest_version = Some(ver.to_string());
-                                    }
-                                } else { latest_version = Some(ver.to_string()); }
-                            }
-
-                            if module_name_filter.is_some() {
-                                // Fetch latest version for author info
-                                let latest_ver = latest_version.as_ref().unwrap();
-                                let manifest_url = format!(
-                                    "https://api.github.com/repos/{}/contents/{}/@{}/manifest.json",
-                                    repo_slug, name, latest_ver
-                                );
-
-                                let mut authors: Vec<String> = vec![];
-                                if let Ok(manifest_resp) = client.get(&manifest_url).send() {
-                                    if manifest_resp.status().is_success() {
-                                        if let Ok(manifest_json) = manifest_resp.json::<JsonValue>() {
-                                            if let Some(content_encoded) = manifest_json.get("content").and_then(JsonValue::as_str) {
-                                                if let Ok(decoded_bytes) = general_purpose::STANDARD.decode(content_encoded.replace('\n', "")) {
-                                                    if let Ok(decoded_str) = String::from_utf8(decoded_bytes) {
-                                                        if let Ok(manifest) = serde_json::from_str::<JsonValue>(&decoded_str) {
-                                                            authors = manifest.get("authors")
-                                                                .and_then(JsonValue::as_array)
-                                                                .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()).collect())
-                                                                .unwrap_or_default();
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                let author_str = if authors.is_empty() { "unknown".to_string() } else {
-                                    authors.iter().map(|a| a.yellow().to_string()).collect::<Vec<_>>().join(", ")
-                                };
-
-                                println!("{} - {}", name.bright_cyan(), author_str);
-
-                                // Track previous deps to omit duplicates
-                                let mut prev_deps: Option<HashMap<String, String>> = None;
-
-                                for ver in all_versions {
-                                    let manifest_url = format!("https://api.github.com/repos/{}/contents/{}/@{}/manifest.json", repo_slug, name, ver);
-                                    if let Ok(manifest_resp) = client.get(&manifest_url).send() {
-                                        if manifest_resp.status().is_success() {
-                                            if let Ok(manifest_json) = manifest_resp.json::<JsonValue>() {
-                                                if let Some(content_encoded) = manifest_json.get("content").and_then(JsonValue::as_str) {
-                                                    if let Ok(decoded_bytes) = general_purpose::STANDARD.decode(content_encoded.replace('\n', "")) {
-                                                        if let Ok(decoded_str) = String::from_utf8(decoded_bytes) {
-                                                            if let Ok(manifest) = serde_json::from_str::<JsonValue>(&decoded_str) {
-                                                                let v_desc = manifest.get("description").and_then(JsonValue::as_str).unwrap_or("");
-                                                                println!("   {} - {}", format!("v{}", ver).green(), v_desc);
-
-                                                                // handle deps
-                                                                if let Some(deps_json) = manifest.get("dependencies").and_then(JsonValue::as_object) {
-                                                                    let deps_map: HashMap<String, String> = deps_json.iter()
-                                                                        .filter_map(|(k,v)| v.as_str().map(|vv| (k.clone(), vv.to_string())))
-                                                                        .collect();
-
-                                                                    if Some(&deps_map) != prev_deps.as_ref() && !deps_map.is_empty() {
-                                                                        println!("   deps:");
-                                                                        for (dep_name, dep_ver) in deps_map.iter() {
-                                                                            println!("      {} - v{}", dep_name.bright_magenta(), dep_ver.green());
-                                                                        }
-                                                                    }
-                                                                    prev_deps = Some(deps_map);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if let Some(latest) = latest_version {
-                                // normal listing: show only latest
-                                let manifest_url = format!("https://api.github.com/repos/{}/contents/{}/@{}/manifest.json", repo_slug, name, latest);
-                                let mut description = String::new();
-                                if let Ok(manifest_resp) = client.get(&manifest_url).send() {
-                                    if manifest_resp.status().is_success() {
-                                        if let Ok(manifest_json) = manifest_resp.json::<JsonValue>() {
-                                            if let Some(content_encoded) = manifest_json.get("content").and_then(JsonValue::as_str) {
-                                                if let Ok(decoded_bytes) = general_purpose::STANDARD.decode(content_encoded.replace('\n', "")) {
-                                                    if let Ok(decoded_str) = String::from_utf8(decoded_bytes) {
-                                                        if let Ok(manifest) = serde_json::from_str::<JsonValue>(&decoded_str) {
-                                                            description = manifest.get("description").and_then(JsonValue::as_str).unwrap_or("").to_string();
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                let mut line = format!("  {}", name.bright_cyan());
-                                if show_ver { line += &format!(" v{} (latest)", latest); }
-                                if show_desc && !description.is_empty() { line += &format!(" - {}", description); }
-                                println!("{}", line);
-                            }
-                        }
-                    }
-                }
-
-                if !found_any {
-                    println!("{}", "No remote modules found".yellow());
-                }
-            }
-        } else {
-            eprintln!("{}", "Failed to connect to GitHub API.".red());
-        }
+        let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+            eprintln!("{}", format!("Failed to create async runtime: {}", e).red());
+            exit(1);
+        });
+        
+        runtime.block_on(async {
+            list_remote_packages_async(repo_slug, &module_name_filter, show_desc, show_ver, show_info_all).await;
+        });
     }
 }
 
@@ -1791,6 +2598,81 @@ fn remove(args: &[String]) {
             }
         }
 
+        let lym_config_path = local_pkg_path.join("lym.json");
+        let mut uninstall_scripts = HashMap::new();
+        
+        if lym_config_path.exists() {
+            if let Ok(config_str) = fs::read_to_string(&lym_config_path) {
+                if let Ok(config_json) = serde_json::from_str::<JsonValue>(&config_str) {
+                    if let Some(scripts) = config_json.get("scripts").and_then(JsonValue::as_object) {
+                        for (script_name, script_path) in scripts {
+                            if script_name == "pre_uninstall" || script_name == "post_uninstall" {
+                                if let Some(path) = script_path.as_str() {
+                                    uninstall_scripts.insert(script_name.clone(), path.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let lucia_executable = Path::new(lucia_path_str);
+
+        let execute_uninstall_script = |script_name: &str, script_file: &str| -> Result<(), String> {
+            let script_path = local_pkg_path.join(script_file);
+            if !script_path.exists() {
+                if verbose {
+                    println!("{}", format!("Script '{}' not found at {}", script_name, script_path.display()).yellow());
+                }
+                return Ok(());
+            }
+
+            if verbose {
+                println!("{}", format!("Running {} script: {}", script_name, script_file).bright_cyan());
+            }
+
+            let original_dir = std::env::current_dir()
+                .map_err(|e| format!("Failed to get current directory: {}", e))?;
+
+            std::env::set_current_dir(&local_pkg_path)
+                .map_err(|e| format!("Failed to change to package directory: {}", e))?;
+
+            let output = Command::new(&lucia_executable)
+                .arg(&script_file)
+                .output()
+                .map_err(|e| format!("Failed to execute {} script: {}", script_name, e))?;
+
+            std::env::set_current_dir(&original_dir)
+                .map_err(|e| format!("Failed to restore original directory: {}", e))?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let exit_code = output.status.code().unwrap_or(-1);
+                
+                eprintln!("{}", format!("Warning: {} script failed with exit code {}: {}", 
+                    script_name, exit_code, stderr).yellow());
+                if verbose {
+                    println!("{}", format!("{} script failed but continuing removal", script_name).yellow());
+                }
+                return Ok(());
+            }
+
+            if verbose {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if !stdout.trim().is_empty() {
+                    println!("{} output: {}", script_name, stdout.trim());
+                }
+                println!("{}", format!("{} script completed successfully", script_name).bright_green());
+            }
+
+            Ok(())
+        };
+
+        if let Some(pre_uninstall_script) = uninstall_scripts.get("pre_uninstall") {
+            let _ = execute_uninstall_script("pre-uninstall", pre_uninstall_script);
+        }
+
         if verbose {
             println!("Removing package directory {}", local_pkg_path.display());
         }
@@ -1798,6 +2680,10 @@ fn remove(args: &[String]) {
         let pb = ProgressBar::new_spinner();
         pb.set_message(format!("Removing package '{}'", pkg_name.bright_cyan()));
         pb.enable_steady_tick(Duration::from_millis(100));
+
+        if let Some(post_uninstall_script) = uninstall_scripts.get("post_uninstall") {
+            let _ = execute_uninstall_script("post-uninstall", post_uninstall_script);
+        }
 
         if let Err(e) = fs::remove_dir_all(&local_pkg_path) {
             pb.finish_and_clear();

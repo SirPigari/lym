@@ -49,7 +49,9 @@ release:
 	@$(MKDIR)
 	@$(MKDIR_BIN)
 ifeq ($(IS_WINDOWS),cmd.exe)
-	@$(MOVE) "$(LYM_DIR)\target\release\$(TARGET_EXE)" "$(subst /,\\,$(TARGET))"
+	@$(MOVE) "$(LYM_DIR)\target\release\$(TARGET_EXE)" "$(subst /,\\,$(TARGET_BIN))"
+	@$(COPY) "$(subst /,\\,$(TARGET_BIN))" "$(subst /,\\,$(TARGET_TMP))"
+	@$(MOVE) "$(subst /,\\,$(TARGET_TMP))" "$(subst /,\\,$(TARGET))"
 else
 	@$(MOVE) "$(LYM_DIR)/target/release/$(TARGET_EXE)" "$(TARGET)"
 endif
