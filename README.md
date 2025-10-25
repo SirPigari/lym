@@ -118,6 +118,72 @@ it should have:
 - **dependencies** (object, optional)  
   Package dependencies with version requirements, e.g., `"package2": "^3.69.42"`.
 
+- **entry_point** (string, optional)  
+  The main file to be executed when the package is imported. Defaults to `main.lc` if not specified.
+
+- **package_type** (string, optional)
+  Type of the package, can be one of the following:
+  - `import` - A standard package that is imported using the `import` statement. (default)
+  - `include` - A package that is included directly into the source code using the `#include` directive.
+  - `plugin` - A package that extends the functionality of the Lucia runtime or preprocessor.
+  - `bindings` - A package that provides bindings to external libraries or systems.
+
+## lym.json
+
+`lym.json` is a configuration file for lym to know what to do with the package. It is located in the root directory of the package.
+
+Example:
+
+```json
+{
+  "ignore": [
+      "*.tmp",
+      "*.log"
+  ],
+  "supported_platforms": [
+      "windows",
+      "linux",
+      "macos"
+  ],
+  "platform_ignore": {
+      "windows": [
+          "*.so"
+      ]
+  },
+  "options": {
+      "overwrite_existing": false,
+      "update_fresh": false
+  }
+}
+```
+
+### Field Descriptions
+
+- **ignore** (array of strings, optional)  
+  List of file patterns to ignore when installing the package.
+
+- **supported_platforms** (array of strings, optional)  
+  List of platforms that the package supports (e.g., "windows", "linux", "macos").
+
+- **platform_ignore** (object, optional)  
+  Platform-specific ignore patterns. Keys are platform names, and values are arrays of file patterns to ignore for that platform.
+
+- **options** (object, optional)
+  Additional options for package installation:
+  - `overwrite_existing` (boolean, optional) - Whether to overwrite existing files during installation. Default is `false`.
+  - `update_fresh` (boolean, optional) - Whether to update only if the package is fresh. Default is `false`.
+  - `ignore_hashes` (object, optional) - Keys are platform names, and values are booleans indicating whether to ignore file hashes for that platform during installation.
+  - `skip_dependencies` (boolean, optional) - Whether to skip installing dependencies. Default is `false`.
+  - `skip_config_check` (boolean, optional) - Whether to skip checking for required config keys. Default is `false`.
+  - `skip_platform_check` (boolean, optional) - Whether to skip checking for supported platforms. Default is `false`.
+
+- **scripts** (object, optional)  
+  Scripts to run at different stages of package installation:
+  - `pre_uninstall` (string, optional) - Command to run before uninstallation.
+  - `post_uninstall` (string, optional) - Command to run after uninstallation.
+  - `pre_install` (string, optional) - Command to run before installation.
+  - `post_install` (string, optional) - Command to run after installation.
+
 ## Good Practices
 
 - **Avoid using `#config` inline preprocessor directives inside your package source.**  
