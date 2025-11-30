@@ -293,6 +293,9 @@ pub struct LymConfig {
     pub overwrite_existing: bool,
     pub ignore_hashes: HashMap<String, String>,
     pub update_fresh: bool,
+    pub skip_dependencies: bool,
+    pub skip_config_check: bool,
+    pub skip_platform_check: bool,
 }
 
 impl Default for LymConfig {
@@ -305,6 +308,9 @@ impl Default for LymConfig {
             overwrite_existing: false,
             ignore_hashes: HashMap::new(),
             update_fresh: false,
+            skip_dependencies: false,
+            skip_config_check: false,
+            skip_platform_check: false,
         }
     }
 }

@@ -358,8 +358,8 @@ fn command_help(cmd: &str) {
                 "Usage:".bright_green().bold(),
                 "lym".bright_cyan().bold(),
                 "publish".bright_cyan(),
-                "[path] [--no-confirm] [-v] [--help]".bright_yellow(),
-                "Publishes a package to the remote repository.".bright_white()
+                "[path] [--no-confirm] [--force] [-v] [--help]".bright_yellow(),
+                "Publishes a package to the remote repository.\n\nOptions:\n  --force    Force republish an existing version\n  --no-confirm  Skip confirmation prompts\n  -v        Enable verbose output".bright_white()
             );
         }
         "login" => {
@@ -713,6 +713,107 @@ async fn download_files_async(
     Ok(())
 }
 
+fn resolve_package_name(
+    client: &Client,
+    repo_slug: &str,
+    pkg_name: &str,
+    no_confirm: bool,
+) -> Result<String, String> {
+    let versions_url = format!("https://api.github.com/repos/{}/contents/{}", repo_slug, pkg_name);
+    let resp = client.get(&versions_url).send().map_err(|e| format!("Failed to check package: {}", e))?;
+    
+    if resp.status().is_success() {
+        return Ok(pkg_name.to_string());
+    }
+    
+    let registry_url = format!("https://api.github.com/repos/{}/contents/registry.json", repo_slug);
+    if let Ok(registry_resp) = client.get(&registry_url).send() {
+        if registry_resp.status().is_success() {
+            if let Ok(registry_json) = registry_resp.json::<JsonValue>() {
+                if let Some(content) = registry_json.get("content").and_then(JsonValue::as_str) {
+                    if let Ok(decoded) = general_purpose::STANDARD.decode(content.replace('\n', "")) {
+                        if let Ok(registry_str) = String::from_utf8(decoded) {
+                            if let Ok(registry) = serde_json::from_str::<JsonValue>(&registry_str) {
+                                if let Some(packages) = registry.get("packages").and_then(JsonValue::as_object) {
+                                    let mut matches = Vec::new();
+                                    for (pkg_folder, pkg_info) in packages {
+                                        if let Some(names) = pkg_info.get("names").and_then(JsonValue::as_array) {
+                                            for name in names {
+                                                if let Some(alias) = name.as_str() {
+                                                    if alias == pkg_name {
+                                                        let authors = pkg_info.get("authors")
+                                                            .and_then(JsonValue::as_array)
+                                                            .map(|arr| arr.iter()
+                                                                .filter_map(|v| v.as_str())
+                                                                .collect::<Vec<_>>()
+                                                                .join(", "))
+                                                            .unwrap_or_else(|| "unknown".to_string());
+                                                        matches.push((pkg_folder.clone(), authors));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    if matches.len() == 1 {
+                                        return Ok(matches[0].0.clone());
+                                    } else if matches.len() > 1 {
+                                        if no_confirm {
+                                            return Err(format!("Multiple packages found with alias '{}'. Use full package name.", pkg_name));
+                                        }
+                                        
+                                        println!("{}", format!("Multiple packages found with alias '{}':", pkg_name).yellow());
+                                        for (i, (folder, authors)) in matches.iter().enumerate() {
+                                            println!("  {}) {} ({})", i + 1, folder.bright_cyan(), authors);
+                                        }
+                                        
+                                        print!("Select package (1-{}): ", matches.len());
+                                        stdout().flush().unwrap();
+                                        let mut input = String::new();
+                                        stdin().read_line(&mut input).unwrap();
+                                        
+                                        if let Ok(choice) = input.trim().parse::<usize>() {
+                                            if choice > 0 && choice <= matches.len() {
+                                                return Ok(matches[choice - 1].0.clone());
+                                            }
+                                        }
+                                        return Err("Invalid selection.".to_string());
+                                    }
+                                    
+                                    let mut all_searchable: Vec<String> = Vec::new();
+                                    let mut name_to_folder: HashMap<String, String> = HashMap::new();
+                                    
+                                    for (pkg_folder, pkg_info) in packages {
+                                        all_searchable.push(pkg_folder.clone());
+                                        name_to_folder.insert(pkg_folder.clone(), pkg_folder.clone());
+                                        
+                                        if let Some(names) = pkg_info.get("names").and_then(JsonValue::as_array) {
+                                            for name in names {
+                                                if let Some(alias) = name.as_str() {
+                                                    all_searchable.push(alias.to_string());
+                                                    name_to_folder.insert(alias.to_string(), pkg_folder.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    if let Some(closest) = find_closest_match(pkg_name, &all_searchable) {
+                                        if name_to_folder.contains_key(closest) {
+                                            return Err(format!("Package '{}' not found. Did you mean '{}'?", pkg_name, closest));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Err(format!("Package '{}' not found", pkg_name))
+}
+
 fn install_single_package(
     pkg_name: &str,
     no_confirm: bool,
@@ -722,24 +823,13 @@ fn install_single_package(
 ) -> Result<(), String> {
     check_and_close_lucia(no_confirm)?;
 
-    let (package_name, requested_version) = if let Some(at_pos) = pkg_name.rfind('@') {
+    let (package_name_or_alias, requested_version) = if let Some(at_pos) = pkg_name.rfind('@') {
         let name = &pkg_name[..at_pos];
         let version = &pkg_name[at_pos + 1..];
         (name, Some(version))
     } else {
         (pkg_name, None)
     };
-
-    if !no_confirm {
-        let result = Confirm::new()
-            .with_prompt(format!("Install package '{}'?", package_name))
-            .default(true)
-            .interact()
-            .map_err(|e| format!("Failed to read user input: {}", e))?;
-        if !result {
-            return Err("Installation cancelled by user.".to_string());
-        }
-    }
 
     let lym_dir = get_lym_dir().map_err(|e| format!("Failed to get lym dir: {}", e))?;
     let config_path = lym_dir.join("config.json");
@@ -784,26 +874,30 @@ fn install_single_package(
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
+    let package_name = resolve_package_name(&client, repo_slug, package_name_or_alias, no_confirm)?;
+    
+    if verbose && package_name != package_name_or_alias {
+        println!("{}", format!("Resolved alias '{}' to package '{}'", package_name_or_alias, package_name).bright_cyan());
+    }
+    
+    if !no_confirm {
+        let result = Confirm::new()
+            .with_prompt(format!("Install package '{}'?", package_name))
+            .default(true)
+            .interact()
+            .map_err(|e| format!("Failed to read user input: {}", e))?;
+        if !result {
+            return Err("Installation cancelled by user.".to_string());
+        }
+    }
+
     let versions_url = format!("https://api.github.com/repos/{}/contents/{}", repo_slug, package_name);
     let resp = client.get(&versions_url)
         .send()
         .map_err(|e| format!("Failed to fetch package versions: {}", e))?;
 
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        let root_url = format!("https://api.github.com/repos/{}/contents/", repo_slug);
-        let all_packages: Vec<String> = client.get(&root_url)
-            .send().ok()
-            .and_then(|r| r.json::<Vec<JsonValue>>().ok())
-            .map(|items| items.iter()
-                .filter_map(|item| item.get("name").and_then(JsonValue::as_str).map(|s| s.to_string()))
-                .collect())
-            .unwrap_or_default();
-
-        if let Some(s) = find_closest_match(package_name, &all_packages) {
-            return Err(format!("Package '{}' not found. Did you mean '{}'?", package_name, s));
-        } else {
-            return Err(format!("Package '{}' not found.", package_name));
-        }
+        return Err(format!("Package '{}' not found after resolution", package_name));
     }
 
     let resp_val: JsonValue = resp.json::<JsonValue>()
@@ -850,7 +944,7 @@ fn install_single_package(
 
     let local_pkg_path = output_path
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| libs_dir.join(package_name));
+        .unwrap_or_else(|| libs_dir.join(&package_name));
 
     let mut installed_version: Option<String> = None;
     if local_pkg_path.exists() {
@@ -964,6 +1058,15 @@ fn install_single_package(
                                     if let Some(update_fresh) = options.get("update_fresh").and_then(JsonValue::as_bool) {
                                         lym_config.update_fresh = update_fresh;
                                     }
+                                    if let Some(skip_dependencies) = options.get("skip_dependencies").and_then(JsonValue::as_bool) {
+                                        lym_config.skip_dependencies = skip_dependencies;
+                                    }
+                                    if let Some(skip_config_check) = options.get("skip_config_check").and_then(JsonValue::as_bool) {
+                                        lym_config.skip_config_check = skip_config_check;
+                                    }
+                                    if let Some(skip_platform_check) = options.get("skip_platform_check").and_then(JsonValue::as_bool) {
+                                        lym_config.skip_platform_check = skip_platform_check;
+                                    }
                                 }
                                 
                                 if let Some(ignore_hashes) = config_json.get("ignore_hashes").and_then(JsonValue::as_object) {
@@ -993,7 +1096,7 @@ fn install_single_package(
         target_platforms.to_vec()
     };
     
-    if !lym_config.supported_platforms.contains(&current_platform.to_string()) {
+    if !lym_config.skip_platform_check && !lym_config.supported_platforms.contains(&current_platform.to_string()) {
         return Err(format!(
             "Package '{}' does not support current platform '{}'. Supported platforms: {:?}",
             package_name, current_platform, lym_config.supported_platforms
@@ -1082,6 +1185,42 @@ fn install_single_package(
     let manifest: JsonValue = serde_json::from_str(&manifest_str)
         .map_err(|e| format!("Failed to parse manifest.json: {}", e))?;
 
+    if !lym_config.skip_config_check {
+        if let Some(required_config) = manifest.get("config").and_then(JsonValue::as_object) {
+            if !required_config.is_empty() {
+                let lucia_config_path = lucia_path
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .map(|env_root| env_root.join("config.json"))
+                    .ok_or("Could not resolve lucia config path")?;
+
+                let lucia_config: JsonValue = if lucia_config_path.exists() {
+                    fs::read_to_string(&lucia_config_path)
+                        .ok()
+                        .and_then(|data| serde_json::from_str(&data).ok())
+                        .unwrap_or_else(|| json!({}))
+                } else {
+                    json!({})
+                };
+
+                let mut missing_keys = Vec::new();
+                for (key, _) in required_config {
+                    if !lucia_config.get(key).is_some() {
+                        missing_keys.push(key.clone());
+                    }
+                }
+
+                if !missing_keys.is_empty() {
+                    return Err(format!(
+                        "Package '{}' requires the following config keys to be enabled in Lucia: {}. Please enable them in your Lucia config.",
+                        package_name,
+                        missing_keys.join(", ")
+                    ));
+                }
+            }
+        }
+    }
+
     let required_version = manifest.get("required_lucia_version")
         .and_then(JsonValue::as_str)
         .unwrap_or("0.0.0");
@@ -1116,7 +1255,7 @@ fn install_single_package(
         }
     }
 
-    if let Some(deps) = manifest.get("dependencies").and_then(JsonValue::as_object) {
+    if !lym_config.skip_dependencies && let Some(deps) = manifest.get("dependencies").and_then(JsonValue::as_object) {
         let deps = deps.iter().filter(|(name, _)| !STD_LIBS.contains_key(name.as_str())).collect::<Vec<(&String, &JsonValue)>>();
         if !deps.is_empty() {
             println!("{}", "Dependencies found:".bright_yellow());
@@ -1790,7 +1929,50 @@ async fn list_remote_packages_async(repo_slug: &str, module_name_filter: &Option
             exit(1);
         });
 
+    println!("{}", "Remote modules:".bright_green().bold());
+
+    let registry_url = format!("https://api.github.com/repos/{}/contents/registry.json", repo_slug);
+    if !show_info_all && module_name_filter.is_none() {
+        if let Ok(registry_resp) = client.get(&registry_url).send().await {
+            if registry_resp.status().is_success() {
+                if let Ok(registry_json) = registry_resp.json::<JsonValue>().await {
+                    if let Some(content) = registry_json.get("content").and_then(JsonValue::as_str) {
+                        if let Ok(decoded) = general_purpose::STANDARD.decode(content.replace('\n', "")) {
+                            if let Ok(registry_str) = String::from_utf8(decoded) {
+                                if let Ok(registry) = serde_json::from_str::<JsonValue>(&registry_str) {
+                                    if let Some(packages) = registry.get("packages").and_then(JsonValue::as_object) {
+                                        for (pkg_name, pkg_info) in packages {
+                                            let mut line = format!("  {}", pkg_name.bright_cyan());
+                                            
+                                            if show_ver {
+                                                if let Some(version) = pkg_info.get("latest_version").and_then(JsonValue::as_str) {
+                                                    line += &format!(" v{}", version);
+                                                }
+                                            }
+                                            
+                                            if show_desc {
+                                                if let Some(desc) = pkg_info.get("description").and_then(JsonValue::as_str) {
+                                                    if !desc.is_empty() {
+                                                        line += &format!(" - {}", desc);
+                                                    }
+                                                }
+                                            }
+                                            
+                                            println!("{}", line);
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let api_url = format!("https://api.github.com/repos/{}/contents/", repo_slug);
+    println!("{}", format!("Registry not found at {}, fetching package list from {}", registry_url, api_url).dimmed());
     
     let resp = match client.get(&api_url).send().await {
         Ok(resp) if resp.status().is_success() => resp,
@@ -1812,14 +1994,12 @@ async fn list_remote_packages_async(repo_slug: &str, module_name_filter: &Option
         }
     };
 
-    println!("{}", "Remote modules:".bright_green().bold());
-
     let mut package_names = Vec::new();
     for item in contents.iter() {
         let name = item.get("name").and_then(JsonValue::as_str).unwrap_or("");
         let item_type = item.get("type").and_then(JsonValue::as_str).unwrap_or("");
         
-        if item_type != "dir" { continue; }
+        if item_type != "dir" || name == "registry.json" { continue; }
         if let Some(filter) = &module_name_filter {
             if name != filter { continue; }
         }
@@ -3267,9 +3447,116 @@ fn new(args: &[String]) {
     }
 }
 
+fn update_registry(
+    client: &Client,
+    repo_slug: &str,
+    username: &str,
+    token: &str,
+    package_name: &str,
+    manifest: &JsonValue,
+    verbose: bool,
+) -> Result<(), String> {
+    if verbose {
+        println!("{}", "Updating registry.json...".bright_cyan());
+    }
+
+    let registry_url = format!("https://api.github.com/repos/{}/contents/registry.json", repo_slug);
+    let mut registry = json!({ "packages": {} });
+    let mut sha: Option<String> = None;
+
+    if let Ok(resp) = client.get(&registry_url)
+        .header("User-Agent", "lym-publish")
+        .basic_auth(username, Some(token))
+        .send() {
+        if resp.status().is_success() {
+            if let Ok(registry_json) = resp.json::<JsonValue>() {
+                sha = registry_json.get("sha").and_then(JsonValue::as_str).map(|s| s.to_string());
+                if let Some(content) = registry_json.get("content").and_then(JsonValue::as_str) {
+                    if let Ok(decoded) = general_purpose::STANDARD.decode(content.replace('\n', "")) {
+                        if let Ok(registry_str) = String::from_utf8(decoded) {
+                            if let Ok(existing_registry) = serde_json::from_str::<JsonValue>(&registry_str) {
+                                registry = existing_registry;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(packages) = registry.get_mut("packages").and_then(JsonValue::as_object_mut) {
+        let version = manifest.get("version").and_then(JsonValue::as_str).unwrap_or("unknown");
+        let description = manifest.get("description").and_then(JsonValue::as_str).unwrap_or("");
+        let authors = manifest.get("authors").cloned().unwrap_or(json!([]));
+        let names = manifest.get("names").cloned().unwrap_or(json!([package_name]));
+
+        // Check if registry already has this exact info
+        if let Some(existing_pkg) = packages.get(package_name) {
+            if existing_pkg.get("latest_version").and_then(JsonValue::as_str) == Some(version) &&
+               existing_pkg.get("description").and_then(JsonValue::as_str) == Some(description) &&
+               existing_pkg.get("authors") == Some(&authors) &&
+               existing_pkg.get("names") == Some(&names) {
+                // Registry is already up to date
+                if verbose {
+                    println!("{}", "Registry already up to date.".bright_green());
+                }
+                return Ok(());
+            }
+        }
+
+        packages.insert(package_name.to_string(), json!({
+            "latest_version": version,
+            "description": description,
+            "authors": authors,
+            "names": names
+        }));
+    }
+
+    let registry_content = serde_json::to_string_pretty(&registry).unwrap();
+    let registry_b64 = general_purpose::STANDARD.encode(registry_content.as_bytes());
+
+    let mut body = json!({
+        "message": format!("Update registry for {}", package_name),
+        "content": registry_b64,
+        "branch": "main"
+    });
+
+    if let Some(s) = sha {
+        body["sha"] = json!(s);
+    }
+
+    let res = client.put(&registry_url)
+        .header("User-Agent", "lym-publish")
+        .basic_auth(username, Some(token))
+        .json(&body)
+        .send();
+
+    match res {
+        Ok(r) if r.status().is_success() => {
+            if verbose {
+                println!("{}", "Registry updated successfully.".bright_green());
+            }
+            Ok(())
+        }
+        Ok(r) => {
+            if verbose {
+                eprintln!("{}", format!("Warning: Failed to update registry: HTTP {}", r.status()).yellow());
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if verbose {
+                eprintln!("{}", format!("Warning: Failed to update registry: {}", e).yellow());
+            }
+            Ok(())
+        }
+    }
+}
+
 fn publish(args: &[String]) {
     let verbose = args.iter().any(|s| s == "-v" || s == "--verbose");
     let no_confirm = args.iter().any(|s| s == "--no-confirm");
+    let force = args.iter().any(|s| s == "--force");
     let path_arg = args.iter().find(|s| !s.starts_with('-')).map_or(".", |s| s.as_str());
     if args.iter().any(|s| s == "--help" || s == "-h") {
         command_help("publish");
@@ -3371,13 +3658,27 @@ fn publish(args: &[String]) {
                 });
 
                 let last_version = versions.last().unwrap();
-                if !is_next_version(version, last_version) {
-                    eprintln!("{}", format!("Version {} is not valid after last published version {}", version, last_version).red());
-                    return;
-                }
-
+                
                 if versions.contains(&version.to_string()) {
-                    eprintln!("{}", format!("Version {} already exists remotely.", version).red());
+                    if !force {
+                        eprintln!("{}", format!("Version {} already exists remotely (same as latest published version).", version).red());
+                        eprintln!("{}", "Use --force to republish this version.".yellow());
+                        return;
+                    } else {
+                        let confirm = Confirm::new()
+                            .with_prompt(format!("Version {} already exists. Are you sure you want to force republish?", version))
+                            .default(false)
+                            .interact()
+                            .unwrap_or(false);
+                        
+                        if !confirm {
+                            println!("{}", "Publish cancelled.".yellow());
+                            return;
+                        }
+                        println!("{}", format!("Force republishing version {}", version).bright_yellow());
+                    }
+                } else if !is_next_version(version, last_version) {
+                    eprintln!("{}", format!("Version {} is not valid after last published version {}", version, last_version).red());
                     return;
                 }
             }
@@ -3391,61 +3692,446 @@ fn publish(args: &[String]) {
     }
 
     let files = collect_files(path, path);
+    println!("{}", format!("Collected {} files", files.len()).bright_green());
 
-    let pb = if !verbose {
-        let pb = ProgressBar::new(files.len() as u64);
-        pb.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-            .unwrap()
-            .progress_chars("#>-"));
-        Some(pb)
-    } else { None };
+    if verbose {
+        println!("{}", format!("Preparing to upload {} files in the commit...", files.len()).bright_cyan());
+        println!("{}", "Connecting to GitHub...".bright_cyan());
+    }
 
-    for file in files.iter() {
-        let remote_path = format!("{}/@{}/{}", lib_name, version, file.to_string_lossy());
-        let content = fs::read(path.join(file)).unwrap_or_else(|_| {
-            eprintln!("{}", format!("Failed to read file {}", file.display()).red());
-            Vec::new()
-        });
-        let content_b64 = general_purpose::STANDARD.encode(&content);
-
-        let body = serde_json::json!({
-            "message": format!("Publish {}@{}", lib_name, version),
-            "content": content_b64,
-            "branch": "main"
-        });
-
-        let upload_url = format!("https://api.github.com/repos/{}/contents/{}", repo_slug, remote_path);
-        let res = client.put(&upload_url)
-            .header("User-Agent", "lym-publish")
-            .basic_auth(&username, Some(&token))
-            .json(&body)
-            .send();
-
-        match res {
-            Ok(r) if r.status().is_success() => {
-                if verbose {
-                    println!("{}", format!("Uploaded {}", file.display()).bright_green());
-                }
-            }
-            Ok(r) => {
-                eprintln!("{}", format!("Failed to upload {}: HTTP {}", file.display(), r.status()).red());
-                return;
-            }
+    let refs_url = format!("https://api.github.com/repos/{}/git/refs/heads/main", repo_slug);
+    let refs_resp = match client.get(&refs_url)
+        .header("User-Agent", "lym-publish")
+        .basic_auth(&username, Some(&token))
+        .send() {
+            Ok(r) => r,
             Err(e) => {
-                eprintln!("{}", format!("Failed to upload {}: {}", file.display(), e).red());
+                eprintln!("{}", format!("Failed to get main branch ref: {}", e).red());
                 return;
             }
-        }
+        };
 
-        if let Some(pb) = &pb {
-            pb.inc(1);
-        }
+    if !refs_resp.status().is_success() {
+        eprintln!("{}", format!("Failed to get main branch: HTTP {}", refs_resp.status()).red());
+        return;
     }
 
-    if let Some(pb) = &pb {
-        pb.finish_with_message("Upload complete");
+    let refs_json: JsonValue = match refs_resp.json() {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("{}", format!("Failed to parse refs: {}", e).red());
+            return;
+        }
+    };
+    
+    let base_commit_sha = match refs_json.get("object")
+        .and_then(|o| o.get("sha"))
+        .and_then(JsonValue::as_str) {
+            Some(s) => s,
+            None => {
+                eprintln!("{}", "Failed to get base commit SHA".red());
+                return;
+            }
+        };
+
+    let commit_url = format!("https://api.github.com/repos/{}/git/commits/{}", repo_slug, base_commit_sha);
+    let commit_resp = match client.get(&commit_url)
+        .header("User-Agent", "lym-publish")
+        .basic_auth(&username, Some(&token))
+        .send() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{}", format!("Failed to get base commit: {}", e).red());
+                return;
+            }
+        };
+
+    let commit_json: JsonValue = match commit_resp.json() {
+        Ok(j) => j,
+        Err(_) => {
+            eprintln!("{}", "Failed to parse commit data".red());
+            return;
+        }
+    };
+    
+    let base_tree_sha = match commit_json.get("tree")
+        .and_then(|t| t.get("sha"))
+        .and_then(JsonValue::as_str) {
+            Some(s) => s,
+            None => {
+                eprintln!("{}", "Failed to get base tree SHA".red());
+                return;
+            }
+        };
+
+    let pb = ProgressBar::new(files.len() as u64);
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+        .unwrap()
+        .progress_chars("=>-"));
+    pb.set_message("Starting...".to_string());
+    
+    let failed_count = Arc::new(Mutex::new(0usize));
+    let processing_files = Arc::new(Mutex::new(Vec::<String>::new()));
+    
+    // Load blob cache (format: hash:sha:timestamp per line)
+    let cache_path = lym_dir.join("blob_cache.txt");
+    let mut blob_cache: HashMap<String, (String, u64)> = if cache_path.exists() {
+        fs::read_to_string(&cache_path)
+            .ok()
+            .map(|content| {
+                content.lines()
+                    .filter_map(|line| {
+                        let parts: Vec<&str> = line.split(':').collect();
+                        if parts.len() == 3 {
+                            let hash = parts[0].to_string();
+                            let sha = parts[1].to_string();
+                            let timestamp = parts[2].parse::<u64>().ok()?;
+                            Some((hash, (sha, timestamp)))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    
+    // Clean up expired cache entries (30 days)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let thirty_days = 30 * 24 * 60 * 60;
+    blob_cache.retain(|_, (_, timestamp)| now - *timestamp < thirty_days);
+    
+    let blob_cache = Arc::new(Mutex::new(blob_cache));
+    
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("{}", format!("Failed to create async runtime: {}", e).red());
+        exit(1);
+    });
+    
+    let tree_items = runtime.block_on(async {
+        // Create async client for blob uploads inside async context
+        let async_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .connect_timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(0)
+            .http2_keep_alive_interval(Some(Duration::from_secs(10)))
+            .http2_keep_alive_timeout(Duration::from_secs(20))
+            .tcp_keepalive(Some(Duration::from_secs(60)))
+            .build()
+            .unwrap_or_else(|e| {
+                eprintln!("{}", format!("Failed to build async client: {}", e).red());
+                exit(1);
+            });
+        
+        let blob_url = format!("https://api.github.com/repos/{}/git/blobs", repo_slug);
+        let upload_tasks: Vec<_> = files.iter().map(|file| {
+            let client = async_client.clone();
+            let blob_url = blob_url.clone();
+            let file_path = path.join(file);
+            let relative_path = file.to_string_lossy().to_string();
+            let failed_count = failed_count.clone();
+            let lib_name = lib_name.to_string();
+            let version = version.to_string();
+            let pb = pb.clone();
+            let processing_files = processing_files.clone();
+            let username_clone = username.to_string();
+            let token_clone = token.to_string();
+            let blob_cache = blob_cache.clone();
+            
+            async move {
+                let display_path = relative_path.replace("\\", "/");
+                
+                // Add to processing list
+                {
+                    let mut files = processing_files.lock().unwrap();
+                    files.push(display_path.clone());
+                    pb.set_message(format!("Creating blobs: {}", files.join(", ")));
+                }
+                
+                let content = match tokio::fs::read(&file_path).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        *failed_count.lock().unwrap() += 1;
+                        // Remove from processing list
+                        {
+                            let mut files = processing_files.lock().unwrap();
+                            files.retain(|f| f != &display_path);
+                            pb.set_message(format!("Creating blobs: {}", files.join(", ")));
+                        }
+                        pb.println(format!("{}", format!("Failed to read file {}: {}", display_path, e).red()));
+                        return None;
+                    }
+                };
+                
+                // Calculate SHA1 hash for cache lookup
+                use sha1::{Sha1, Digest};
+                let mut hasher = Sha1::new();
+                hasher.update(&content);
+                let hash = format!("{:x}", hasher.finalize());
+                
+                // Check cache first
+                let cached_sha = {
+                    let cache = blob_cache.lock().unwrap();
+                    cache.get(&hash).map(|(sha, _)| sha.clone())
+                };
+                
+                let blob_sha = if let Some(sha) = cached_sha {
+                    // Remove from processing list
+                    {
+                        let mut files = processing_files.lock().unwrap();
+                        files.retain(|f| f != &display_path);
+                        pb.set_message(format!("Creating blobs: {}", files.join(", ")));
+                    }
+                    pb.inc(1);
+                    sha
+                } else {
+                    // Create new blob
+                    let content_b64 = general_purpose::STANDARD.encode(&content);
+                    let blob_body = json!({
+                        "content": content_b64,
+                        "encoding": "base64"
+                    });
+                    
+                    let response = client.post(&blob_url)
+                        .header("User-Agent", "lym-publish")
+                        .basic_auth(&username_clone, Some(&token_clone))
+                        .json(&blob_body)
+                        .send()
+                        .await;
+                    
+                    match response {
+                        Ok(r) if r.status().is_success() => {
+                            if let Ok(blob_json) = r.json::<JsonValue>().await {
+                                if let Some(sha) = blob_json.get("sha").and_then(JsonValue::as_str) {
+                                    // Add to cache
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs();
+                                    {
+                                        let mut cache = blob_cache.lock().unwrap();
+                                        cache.insert(hash.clone(), (sha.to_string(), now));
+                                    }
+                                    
+                                    // Remove from processing list
+                                    {
+                                        let mut files = processing_files.lock().unwrap();
+                                        files.retain(|f| f != &display_path);
+                                        pb.set_message(format!("Creating blobs: {}", files.join(", ")));
+                                    }
+                                    pb.inc(1);
+                                    sha.to_string()
+                                } else {
+                                    *failed_count.lock().unwrap() += 1;
+                                    // Remove from processing list
+                                    {
+                                        let mut files = processing_files.lock().unwrap();
+                                        files.retain(|f| f != &display_path);
+                                        pb.set_message(format!("Creating blobs: {}", files.join(", ")));
+                                    }
+                                    pb.println(format!("{}", format!("Failed to get SHA from blob response for {}", display_path).red()));
+                                    return None;
+                                }
+                            } else {
+                                *failed_count.lock().unwrap() += 1;
+                                // Remove from processing list
+                                {
+                                    let mut files = processing_files.lock().unwrap();
+                                    files.retain(|f| f != &display_path);
+                                    pb.set_message(format!("Creating blobs: {}", files.join(", ")));
+                                }
+                                pb.println(format!("{}", format!("Failed to parse blob response for {}", display_path).red()));
+                                return None;
+                            }
+                        }
+                        Ok(r) => {
+                            *failed_count.lock().unwrap() += 1;
+                            // Remove from processing list
+                            {
+                                let mut files = processing_files.lock().unwrap();
+                                files.retain(|f| f != &display_path);
+                                pb.set_message(format!("Creating blobs: {}", files.join(", ")));
+                            }
+                            pb.println(format!("{}", format!("Failed to create blob for {}: HTTP {}", display_path, r.status()).red()));
+                            return None;
+                        }
+                        Err(e) => {
+                            *failed_count.lock().unwrap() += 1;
+                            // Remove from processing list
+                            {
+                                let mut files = processing_files.lock().unwrap();
+                                files.retain(|f| f != &display_path);
+                                pb.set_message(format!("Creating blobs: {}", files.join(", ")));
+                            }
+                            pb.println(format!("{}", format!("Failed to create blob for {}: {}", display_path, e).red()));
+                            return None;
+                        }
+                    }
+                };
+                
+                let full_path = format!("{}/@{}/{}", lib_name, version, display_path);
+                Some(json!({
+                    "path": full_path,
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": blob_sha
+                }))
+            }
+        }).collect();
+        
+        let mut stream = FuturesUnordered::new();
+        let mut tasks = upload_tasks.into_iter();
+        
+        let concurrency = std::cmp::min(5, files.len());
+        for _ in 0..concurrency {
+            if let Some(task) = tasks.next() {
+                stream.push(task);
+            }
+        }
+        
+        let mut results = Vec::new();
+        while let Some(result) = stream.next().await {
+            if let Some(item) = result {
+                results.push(item);
+            }
+            
+            if let Some(task) = tasks.next() {
+                stream.push(task);
+            }
+        }
+        
+        results
+    });
+    
+    let failed = *failed_count.lock().unwrap();
+    pb.finish();
+    
+    if failed > 0 {
+        eprintln!("{}", format!("Failed to upload {} file(s). Aborting.", failed).red());
+        return;
     }
+
+    println!("{}", "Creating commit... ".bright_cyan());
+
+    let tree_body = json!({
+        "base_tree": base_tree_sha,
+        "tree": tree_items
+    });
+
+    let tree_url = format!("https://api.github.com/repos/{}/git/trees", repo_slug);
+    let tree_resp = match client.post(&tree_url)
+        .header("User-Agent", "lym-publish")
+        .basic_auth(&username, Some(&token))
+        .json(&tree_body)
+        .send() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{}", format!("Failed to create tree: {}", e).red());
+                return;
+            }
+        };
+
+    if !tree_resp.status().is_success() {
+        eprintln!("{}", format!("Failed to create tree: HTTP {}", tree_resp.status()).red());
+        return;
+    }
+
+    let tree_json: JsonValue = match tree_resp.json() {
+        Ok(j) => j,
+        Err(_) => {
+            eprintln!("{}", "Failed to parse tree response".red());
+            return;
+        }
+    };
+    
+    let new_tree_sha = match tree_json.get("sha").and_then(JsonValue::as_str) {
+        Some(s) => s,
+        None => {
+            eprintln!("{}", "Failed to get new tree SHA".red());
+            return;
+        }
+    };
+
+    let commit_body = json!({"message": format!("Publish {}@{}", lib_name, version),
+        "tree": new_tree_sha,
+        "parents": [base_commit_sha]
+    });
+
+    let new_commit_url = format!("https://api.github.com/repos/{}/git/commits", repo_slug);
+    let new_commit_resp = match client.post(&new_commit_url)
+        .header("User-Agent", "lym-publish")
+        .basic_auth(&username, Some(&token))
+        .json(&commit_body)
+        .send() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{}", format!("Failed to create commit: {}", e).red());
+                return;
+            }
+        };
+
+    if !new_commit_resp.status().is_success() {
+        eprintln!("{}", format!("Failed to create commit: HTTP {}", new_commit_resp.status()).red());
+        return;
+    }
+
+    let new_commit_json: JsonValue = match new_commit_resp.json() {
+        Ok(j) => j,
+        Err(_) => {
+            eprintln!("{}", "Failed to parse commit response".red());
+            return;
+        }
+    };
+    
+    let new_commit_sha = match new_commit_json.get("sha").and_then(JsonValue::as_str) {
+        Some(s) => s,
+        None => {
+            eprintln!("{}", "Failed to get new commit SHA".red());
+            return;
+        }
+    };
+
+    println!("{}", "Updating registry... ".bright_cyan());
+
+    let update_ref_body = json!({
+        "sha": new_commit_sha,
+        "force": false
+    });
+
+    let update_ref_resp = match client.patch(&refs_url)
+        .header("User-Agent", "lym-publish")
+        .basic_auth(&username, Some(&token))
+        .json(&update_ref_body)
+        .send() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{}", format!("Failed to update main branch: {}", e).red());
+                return;
+            }
+        };
+
+    if !update_ref_resp.status().is_success() {
+        eprintln!("{}", format!("Failed to update main branch: HTTP {}", update_ref_resp.status()).red());
+        return;
+    }
+
+    let _ = update_registry(&client, repo_slug, &username, &token, lib_name, &manifest, verbose);
+
+    // Save blob cache
+    let cache_content = {
+        let cache = blob_cache.lock().unwrap();
+        cache.iter()
+            .map(|(hash, (sha, timestamp))| format!("{}:{}:{}", hash, sha, timestamp))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let _ = fs::write(&cache_path, cache_content);
 
     println!("{}", format!("Package {}@{} published successfully!", lib_name, version).bright_green());
     println!("{}", format!("View it here: https://github.com/{}/tree/main/{}/@{}", repo_slug, lib_name, version).bright_blue());
