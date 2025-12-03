@@ -314,3 +314,27 @@ impl Default for LymConfig {
         }
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct RunnerConfig {
+    pub command: String,
+    pub working_dir: Option<String>,
+    pub name: String,
+    pub exports: HashMap<String, String>, // dest_path: source_path
+    pub deps: Vec<String>, // dependency commands to run before build
+}
+
+#[derive(Debug, Clone)]
+pub struct ArtifactConfig {
+    pub runners: HashMap<String, RunnerConfig>, // runner_name: config
+}
+
+pub fn normalize_runner_name(runner: &str) -> String {
+    let lower = runner.to_lowercase();
+    match lower.as_str() {
+        "linux" => "ubuntu-latest".to_string(),
+        "macos" => "macos-latest".to_string(),
+        "windows" => "windows-latest".to_string(),
+        _ => lower,
+    }
+}
