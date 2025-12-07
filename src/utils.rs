@@ -264,21 +264,37 @@ pub fn get_current_platform() -> &'static str {
 }
 
 pub fn should_ignore_file(file_path: &str, ignore_patterns: &[String]) -> bool {
+    let file = Path::new(file_path);
+    let filename = file.file_name().unwrap_or_default().to_string_lossy();
+    
     for pattern_str in ignore_patterns {
+        if pattern_str.ends_with('/') {
+            let pattern_dir = pattern_str.trim_end_matches('/');
+            let pattern_path = Path::new(pattern_dir);
+            
+            if file.starts_with(pattern_path) {
+                return true;
+            }
+            continue;
+        }
+        
         if let Ok(pattern) = Pattern::new(pattern_str) {
             if pattern.matches(file_path) {
                 return true;
             }
         }
         
-        if pattern_str.ends_with('/') {
-            let pattern_dir = pattern_str.trim_end_matches('/');
-            let pattern_path = Path::new(pattern_dir);
-            let file = Path::new(file_path);
+        if !pattern_str.contains('/') && !pattern_str.contains('\\') && !pattern_str.contains('*') && !pattern_str.contains('?') {
+            let is_root = file.parent().map_or(true, |p| p == Path::new("") || p == Path::new("."));
+            let filename_matches = pattern_str == &filename;
             
-            if file.starts_with(pattern_path) {
+            if is_root && filename_matches {
                 return true;
             }
+        }
+        
+        if pattern_str == file_path {
+            return true;
         }
     }
     false

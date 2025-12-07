@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose, Engine as _};
 use colored::*;
 use dialoguer::{Confirm, self};
+use sha1::{Sha1, Digest};
 
 use getch_rs::{Getch, Key};
 use indicatif::{ProgressBar, ProgressStyle, self};
@@ -8,7 +9,7 @@ use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT, AUTHORIZATION};
 use serde_json::{Value as JsonValue, Value, json};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io;
@@ -713,6 +714,56 @@ async fn download_files_async(
     Ok(())
 }
 
+fn check_alias_conflicts(
+    client: &Client,
+    repo_slug: &str,
+    package_name: &str,
+) -> Result<Vec<String>, String> {
+    let registry_url = format!("https://api.github.com/repos/{}/contents/registry.json", repo_slug);
+    let mut conflicts = Vec::new();
+    
+    if let Ok(registry_resp) = client.get(&registry_url).send() {
+        if registry_resp.status().is_success() {
+            if let Ok(registry_json) = registry_resp.json::<JsonValue>() {
+                if let Some(content) = registry_json.get("content").and_then(JsonValue::as_str) {
+                    if let Ok(decoded) = general_purpose::STANDARD.decode(content.replace('\n', "")) {
+                        if let Ok(registry_str) = String::from_utf8(decoded) {
+                            if let Ok(registry) = serde_json::from_str::<JsonValue>(&registry_str) {
+                                if let Some(packages) = registry.get("packages").and_then(JsonValue::as_object) {
+                                    for (pkg_folder, pkg_info) in packages {
+                                        if pkg_folder == package_name {
+                                            continue;
+                                        }
+                                        
+                                        if let Some(names) = pkg_info.get("names").and_then(JsonValue::as_array) {
+                                            for name in names {
+                                                if let Some(alias) = name.as_str() {
+                                                    if alias == package_name {
+                                                        let authors = pkg_info.get("authors")
+                                                            .and_then(JsonValue::as_array)
+                                                            .map(|arr| arr.iter()
+                                                                .filter_map(|v| v.as_str())
+                                                                .collect::<Vec<_>>()
+                                                                .join(", "))
+                                                            .unwrap_or_else(|| "unknown".to_string());
+                                                        conflicts.push(format!("{} ({})", pkg_folder, authors));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(conflicts)
+}
+
 fn resolve_package_name(
     client: &Client,
     repo_slug: &str,
@@ -932,8 +983,8 @@ fn install_single_package(
         if version_dirs.contains(&req_ver.to_string()) {
             req_ver.to_string()
         } else {
-            return Err(format!("Version '{}' not found for package '{}'. Available versions: {:?}", 
-                req_ver, package_name, version_dirs));
+            return Err(format!("Version '{}' not found for package '{}'. Available versions: {}", 
+                req_ver, package_name, version_dirs.join(", ")));
         }
     } else {
         version_dirs.last().unwrap().clone()
@@ -3757,6 +3808,67 @@ fn publish(args: &[String]) {
         exit(1);
     });
 
+    let lym_dir = get_lym_dir().unwrap_or_else(|e| {
+        eprintln!("{}", format!("Failed to get Lym dir: {}", e).red());
+        exit(1);
+    });
+    let config_path = lym_dir.join("config.json");
+    let config: Value = fs::read_to_string(&config_path)
+        .map(|s| serde_json::from_str(&s))
+        .unwrap_or_else(|_| {
+            eprintln!("{}", "Failed to read config.json".red());
+            exit(1);
+        })
+        .unwrap();
+
+    let repo_slug = config.get("repository_slug").and_then(Value::as_str).unwrap_or_else(|| {
+        eprintln!("{}", "repository_slug missing in config.json".red());
+        exit(1);
+    });
+
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static("lym-publish"));
+    if let Some((username_ref, token_ref)) = Some((&username, &token)) {
+        let auth_val = general_purpose::STANDARD.encode(format!("{}:{}", username_ref, token_ref));
+        let auth_header = format!("Basic {}", auth_val);
+        if let Ok(header_val) = HeaderValue::from_str(&auth_header) {
+            headers.insert(AUTHORIZATION, header_val);
+        }
+    }
+    
+    let temp_client = Client::builder()
+        .default_headers(headers)
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| Client::new());
+    
+    if let Ok(conflicts) = check_alias_conflicts(&temp_client, repo_slug, lib_name) {
+        if !conflicts.is_empty() {
+            println!();
+            println!("{}", "⚠️  WARNING: Package alias conflict detected!".bright_yellow().bold());
+            println!("{}", format!("   Your package alias '{}' is already used as an alias by:", lib_name).yellow());
+            for conflict in &conflicts {
+                println!("{}", format!("     - {}", conflict).yellow());
+            }
+            println!("{}", "   Users might not choose your package when installing this name.".yellow());
+            println!("{}", "   Consider using a unique name or adding distinctive aliases.".yellow());
+            println!();
+            
+            if !no_confirm {
+                let proceed = Confirm::new()
+                    .with_prompt("Do you want to proceed with publishing anyway?")
+                    .default(false)
+                    .interact()
+                    .unwrap_or(false);
+                
+                if !proceed {
+                    println!("{}", "Publish cancelled by user.".yellow());
+                    return;
+                }
+            }
+        }
+    }
+
     if !no_confirm {
         let confirm = Confirm::new()
             .with_prompt(format!("You are about to publish {}@{} to the remote repository. Continue?", lib_name, version))
@@ -3788,24 +3900,6 @@ fn publish(args: &[String]) {
             }
         }
     }
-
-    let lym_dir = get_lym_dir().unwrap_or_else(|e| {
-        eprintln!("{}", format!("Failed to get Lym dir: {}", e).red());
-        exit(1);
-    });
-    let config_path = lym_dir.join("config.json");
-    let config: Value = fs::read_to_string(&config_path)
-        .map(|s| serde_json::from_str(&s))
-        .unwrap_or_else(|_| {
-            eprintln!("{}", "Failed to read config.json".red());
-            exit(1);
-        })
-        .unwrap();
-
-    let repo_slug = config.get("repository_slug").and_then(Value::as_str).unwrap_or_else(|| {
-        eprintln!("{}", "repository_slug missing in config.json".red());
-        exit(1);
-    });
 
     let client = Client::new();
     let package_url = format!("https://api.github.com/repos/{}/contents/{}", repo_slug, lib_name);
@@ -4235,144 +4329,194 @@ fn publish(args: &[String]) {
         let workflow_filename = format!("{}@{}.yml", lib_name, version);
         let workflow_path = format!(".github/workflows/{}", workflow_filename);
         
+        let workflow_content_hash = {
+            let header = format!("blob {}\0", workflow_yaml.len());
+            let mut hasher = Sha1::new();
+            hasher.update(header.as_bytes());
+            hasher.update(workflow_yaml.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+        let mut skip_workflow_commit = false;
+        
+        if let Some(existing_hash) = existing_file_hashes.get(&workflow_path) {
+            if existing_hash == &workflow_content_hash {
+                skip_workflow_commit = true;
+                if verbose {
+                    println!("{}", format!("Workflow file {} unchanged, skipping commit", workflow_path).bright_yellow());
+                }
+            }
+        }
+        
         let workflow_b64 = general_purpose::STANDARD.encode(workflow_yaml.as_bytes());
         let workflow_blob_body = json!({
             "content": workflow_b64,
             "encoding": "base64"
         });
         
-        let blob_url = format!("https://api.github.com/repos/{}/git/blobs", repo_slug);
-        let workflow_blob_resp = match client.post(&blob_url)
-            .header("User-Agent", "lym-publish")
-            .basic_auth(&username, Some(&token))
-            .json(&workflow_blob_body)
-            .send() {
-                Ok(r) if r.status().is_success() => r,
-                Ok(r) => {
-                    eprintln!("{}", format!("Failed to create workflow blob: HTTP {}", r.status()).red());
+        let workflow_commit_sha;
+        let final_base_tree;
+        
+        if skip_workflow_commit {
+            workflow_commit_sha = base_commit_sha.to_string();
+            final_base_tree = base_tree_sha.to_string();
+        } else {
+            let blob_url = format!("https://api.github.com/repos/{}/git/blobs", repo_slug);
+            let workflow_blob_resp = match client.post(&blob_url)
+                .header("User-Agent", "lym-publish")
+                .basic_auth(&username, Some(&token))
+                .json(&workflow_blob_body)
+                .send() {
+                    Ok(r) if r.status().is_success() => r,
+                    Ok(r) => {
+                        eprintln!("{}", format!("Failed to create workflow blob: HTTP {}", r.status()).red());
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("{}", format!("Failed to create workflow blob: {}", e).red());
+                        return;
+                    }
+                };
+            
+            let workflow_blob_json: JsonValue = match workflow_blob_resp.json() {
+                Ok(j) => j,
+                Err(_) => {
+                    eprintln!("{}", "Failed to parse workflow blob response".red());
                     return;
                 }
-                Err(e) => {
-                    eprintln!("{}", format!("Failed to create workflow blob: {}", e).red());
+            };
+            
+            let workflow_blob_sha = match workflow_blob_json.get("sha").and_then(JsonValue::as_str) {
+                Some(s) => s.to_string(),
+                None => {
+                    eprintln!("{}", "Failed to get workflow blob SHA".red());
+                    return;
+                }
+            };
+            
+            if verbose {
+                println!("{}", format!("Workflow blob SHA: {}", workflow_blob_sha).bright_blue());
+            }
+            
+            let workflow_tree_body = json!({
+                "base_tree": base_tree_sha,
+                "tree": [json!({
+                    "path": workflow_path,
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": workflow_blob_sha
+                })]
+            });
+            
+            let tree_url = format!("https://api.github.com/repos/{}/git/trees", repo_slug);
+            let workflow_tree_resp = match client.post(&tree_url)
+                .header("User-Agent", "lym-publish")
+                .basic_auth(&username, Some(&token))
+                .json(&workflow_tree_body)
+                .send() {
+                    Ok(r) if r.status().is_success() => r,
+                    Ok(r) => {
+                        let status = r.status();
+                        let error_body = r.text().unwrap_or_else(|_| "Could not read response".to_string());
+                        eprintln!("{}", format!("Failed to create workflow tree: HTTP {}", status).red());
+                        eprintln!("{}", format!("Response: {}", error_body).red());
+                        if verbose {
+                            eprintln!("{}", format!("Request body: {}", serde_json::to_string_pretty(&workflow_tree_body).unwrap_or_default()).yellow());
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("{}", format!("Failed to create workflow tree: {}", e).red());
+                        return;
+                    }
+                };
+            
+            let workflow_tree_json: JsonValue = match workflow_tree_resp.json() {
+                Ok(j) => j,
+                Err(_) => {
+                    eprintln!("{}", "Failed to parse workflow tree response".red());
+                    return;
+                }
+            };
+            
+            let workflow_tree_sha = match workflow_tree_json.get("sha").and_then(JsonValue::as_str) {
+                Some(s) => s.to_string(),
+                None => {
+                    eprintln!("{}", "Failed to get workflow tree SHA".red());
                     return;
                 }
             };
         
-        let workflow_blob_json: JsonValue = match workflow_blob_resp.json() {
-            Ok(j) => j,
-            Err(_) => {
-                eprintln!("{}", "Failed to parse workflow blob response".red());
-                return;
+            let workflow_commit_body = json!({
+                "message": format!("Add workflow for {}@{} artifacts", lib_name, version),
+                "tree": workflow_tree_sha,
+                "parents": [base_commit_sha]
+            });
+            
+            let commit_url = format!("https://api.github.com/repos/{}/git/commits", repo_slug);
+            let workflow_commit_resp = match client.post(&commit_url)
+                .header("User-Agent", "lym-publish")
+                .basic_auth(&username, Some(&token))
+                .json(&workflow_commit_body)
+                .send() {
+                    Ok(r) if r.status().is_success() => r,
+                    Ok(r) => {
+                        eprintln!("{}", format!("Failed to create workflow commit: HTTP {}", r.status()).red());
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("{}", format!("Failed to create workflow commit: {}", e).red());
+                        return;
+                    }
+                };
+            
+            let workflow_commit_json: JsonValue = match workflow_commit_resp.json() {
+                Ok(j) => j,
+                Err(_) => {
+                    eprintln!("{}", "Failed to parse workflow commit response".red());
+                    return;
+                }
+            };
+            
+            workflow_commit_sha = match workflow_commit_json.get("sha").and_then(JsonValue::as_str) {
+                Some(s) => s.to_string(),
+                None => {
+                    eprintln!("{}", "Failed to get workflow commit SHA".red());
+                    return;
+                }
+            };
+            
+            if verbose {
+                println!("{}", format!("Workflow commit SHA: {}", workflow_commit_sha).bright_blue());
             }
-        };
-        
-        let workflow_blob_sha = match workflow_blob_json.get("sha").and_then(JsonValue::as_str) {
-            Some(s) => s.to_string(),
-            None => {
-                eprintln!("{}", "Failed to get workflow blob SHA".red());
-                return;
-            }
-        };
-        
-        if verbose {
-            println!("{}", format!("Workflow blob SHA: {}", workflow_blob_sha).bright_blue());
+            
+            final_base_tree = workflow_tree_sha;
         }
         
-        let workflow_tree_body = json!({
-            "base_tree": base_tree_sha,
-            "tree": [json!({
-                "path": workflow_path,
-                "mode": "100644",
-                "type": "blob",
-                "sha": workflow_blob_sha
-            })]
-        });
-        
-        let tree_url = format!("https://api.github.com/repos/{}/git/trees", repo_slug);
-        let workflow_tree_resp = match client.post(&tree_url)
-            .header("User-Agent", "lym-publish")
-            .basic_auth(&username, Some(&token))
-            .json(&workflow_tree_body)
-            .send() {
-                Ok(r) if r.status().is_success() => r,
-                Ok(r) => {
-                    let status = r.status();
-                    let error_body = r.text().unwrap_or_else(|_| "Could not read response".to_string());
-                    eprintln!("{}", format!("Failed to create workflow tree: HTTP {}", status).red());
-                    eprintln!("{}", format!("Response: {}", error_body).red());
+        let mut final_tree_items = tree_items;
+        if force && !existing_file_hashes.is_empty() {
+            let current_files: HashSet<String> = files.iter()
+                .map(|f| f.to_string_lossy().replace("\\", "/"))
+                .collect();
+            
+            for (existing_path, _) in &existing_file_hashes {
+                if !current_files.contains(existing_path) {
+                    let full_path = format!("{}/@{}/{}", lib_name, version, existing_path);
+                    final_tree_items.push(json!({
+                        "path": full_path,
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": null
+                    }));
                     if verbose {
-                        eprintln!("{}", format!("Request body: {}", serde_json::to_string_pretty(&workflow_tree_body).unwrap_or_default()).yellow());
+                        println!("{}", format!("Deleting file: {}", existing_path).bright_red());
                     }
-                    return;
                 }
-                Err(e) => {
-                    eprintln!("{}", format!("Failed to create workflow tree: {}", e).red());
-                    return;
-                }
-            };
-        
-        let workflow_tree_json: JsonValue = match workflow_tree_resp.json() {
-            Ok(j) => j,
-            Err(_) => {
-                eprintln!("{}", "Failed to parse workflow tree response".red());
-                return;
             }
-        };
-        
-        let workflow_tree_sha = match workflow_tree_json.get("sha").and_then(JsonValue::as_str) {
-            Some(s) => s.to_string(),
-            None => {
-                eprintln!("{}", "Failed to get workflow tree SHA".red());
-                return;
-            }
-        };
-    
-        let workflow_commit_body = json!({
-            "message": format!("Add workflow for {}@{} artifacts", lib_name, version),
-            "tree": workflow_tree_sha,
-            "parents": [base_commit_sha]
-        });
-        
-        let commit_url = format!("https://api.github.com/repos/{}/git/commits", repo_slug);
-        let workflow_commit_resp = match client.post(&commit_url)
-            .header("User-Agent", "lym-publish")
-            .basic_auth(&username, Some(&token))
-            .json(&workflow_commit_body)
-            .send() {
-                Ok(r) if r.status().is_success() => r,
-                Ok(r) => {
-                    eprintln!("{}", format!("Failed to create workflow commit: HTTP {}", r.status()).red());
-                    return;
-                }
-                Err(e) => {
-                    eprintln!("{}", format!("Failed to create workflow commit: {}", e).red());
-                    return;
-                }
-            };
-        
-        let workflow_commit_json: JsonValue = match workflow_commit_resp.json() {
-            Ok(j) => j,
-            Err(_) => {
-                eprintln!("{}", "Failed to parse workflow commit response".red());
-                return;
-            }
-        };
-        
-        let workflow_commit_sha = match workflow_commit_json.get("sha").and_then(JsonValue::as_str) {
-            Some(s) => s.to_string(),
-            None => {
-                eprintln!("{}", "Failed to get workflow commit SHA".red());
-                return;
-            }
-        };
-        
-        if verbose {
-            println!("{}", format!("Workflow commit SHA: {}", workflow_commit_sha).bright_blue());
         }
         
         let package_tree_body = json!({
-            "base_tree": workflow_tree_sha,
-            "tree": tree_items
+            "base_tree": final_base_tree,
+            "tree": final_tree_items
         });
         
         let package_tree_resp = match client.post(&tree_url)
@@ -4451,9 +4595,31 @@ fn publish(args: &[String]) {
         
         package_commit_sha
     } else {
+        let mut final_tree_items = tree_items;
+        if force && !existing_file_hashes.is_empty() {
+            let current_files: HashSet<String> = files.iter()
+                .map(|f| f.to_string_lossy().replace("\\", "/"))
+                .collect();
+            
+            for (existing_path, _) in &existing_file_hashes {
+                if !current_files.contains(existing_path) {
+                    let full_path = format!("{}/@{}/{}", lib_name, version, existing_path);
+                    final_tree_items.push(json!({
+                        "path": full_path,
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": null
+                    }));
+                    if verbose {
+                        println!("{}", format!("Deleting file: {}", existing_path).bright_red());
+                    }
+                }
+            }
+        }
+        
         let tree_body = json!({
             "base_tree": base_tree_sha,
-            "tree": tree_items
+            "tree": final_tree_items
         });
 
         let tree_url = format!("https://api.github.com/repos/{}/git/trees", repo_slug);
@@ -4675,40 +4841,42 @@ fn publish(args: &[String]) {
                             last_status = status.to_string();
                         }
                         
-                        if let Ok(jobs_resp) = client.get(&jobs_url)
-                            .header("User-Agent", "lym-publish")
-                            .basic_auth(&username, Some(&token))
-                            .send() {
-                                if let Ok(jobs_json) = jobs_resp.json::<JsonValue>() {
-                                    if let Some(jobs_arr) = jobs_json.get("jobs").and_then(JsonValue::as_array) {
-                                        for job in jobs_arr {
-                                            if let (Some(job_name), Some(job_status)) = (
-                                                job.get("name").and_then(JsonValue::as_str),
-                                                job.get("status").and_then(JsonValue::as_str)
-                                            ) {
-                                                let job_conclusion = job.get("conclusion").and_then(JsonValue::as_str);
-                                                let current_status = if job_status == "completed" {
-                                                    job_conclusion.unwrap_or("completed").to_string()
-                                                } else {
-                                                    job_status.to_string()
-                                                };
-                                                
-                                                if job_statuses.get(job_name) != Some(&current_status) {
-                                                    let status_display = match current_status.as_str() {
-                                                        "success" => current_status.bright_green(),
-                                                        "failure" | "cancelled" => current_status.red(),
-                                                        "in_progress" => current_status.yellow(),
-                                                        "queued" | "waiting" => current_status.bright_black(),
-                                                        _ => current_status.normal()
+                        if status != "completed" {
+                            if let Ok(jobs_resp) = client.get(&jobs_url)
+                                .header("User-Agent", "lym-publish")
+                                .basic_auth(&username, Some(&token))
+                                .send() {
+                                    if let Ok(jobs_json) = jobs_resp.json::<JsonValue>() {
+                                        if let Some(jobs_arr) = jobs_json.get("jobs").and_then(JsonValue::as_array) {
+                                            for job in jobs_arr {
+                                                if let (Some(job_name), Some(job_status)) = (
+                                                    job.get("name").and_then(JsonValue::as_str),
+                                                    job.get("status").and_then(JsonValue::as_str)
+                                                ) {
+                                                    let job_conclusion = job.get("conclusion").and_then(JsonValue::as_str);
+                                                    let current_status = if job_status == "completed" {
+                                                        job_conclusion.unwrap_or("completed").to_string()
+                                                    } else {
+                                                        job_status.to_string()
                                                     };
-                                                    println!("{}", format!("  {} runner: {}", job_name, status_display));
-                                                    job_statuses.insert(job_name.to_string(), current_status);
+                                                    
+                                                    if job_statuses.get(job_name) != Some(&current_status) {
+                                                        let status_display = match current_status.as_str() {
+                                                            "success" => current_status.bright_green(),
+                                                            "failure" | "cancelled" => current_status.red(),
+                                                            "in_progress" => current_status.yellow(),
+                                                            "queued" | "waiting" => current_status.bright_black(),
+                                                            _ => current_status.normal()
+                                                        };
+                                                        println!("{}", format!("  {} runner: {}", job_name, status_display));
+                                                        job_statuses.insert(job_name.to_string(), current_status);
+                                                    }
                                                 }
                                             }
                                         }
                                     }
                                 }
-                            }
+                        }
                         
                         if status == "completed" {
                             match conclusion {
