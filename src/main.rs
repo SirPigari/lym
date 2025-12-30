@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose, Engine as _};
 use colored::*;
-use dialoguer::{Confirm, self};
+use dialoguer::{Confirm, Select, Input, self};
 use sha1::{Sha1, Digest};
 
 use getch_rs::{Getch, Key};
@@ -23,9 +23,11 @@ use tokio::time::{interval, Duration as TokioDuration};
 
 mod db;
 mod utils;
+mod update_lucia;
 
 use db::{STD_LIBS, load_std_libs};
 use utils::{check_version, parse_bytes, format_bytes, json_type, is_next_version, find_closest_match, cmp_version, git_blob_hash, get_current_platform, should_ignore_file, LymConfig, ArtifactConfig, RunnerConfig, normalize_runner_name};
+use update_lucia::update_lucia;
 
 // lym - Lucia package manager
 // 'lym' isnt an acronym if you were wondering
@@ -229,9 +231,223 @@ fn collect_files(base: &Path, current: &Path) -> Vec<PathBuf> {
     files
 }
 
+fn update_packages(command_args: &[String]) -> Result<(), String> {
+    if command_args.contains(&"--help".to_string()) || command_args.contains(&"-h".to_string()) {
+        command_help("update");
+        return Ok(());
+    }
+
+    let verbose = command_args.contains(&"-v".to_string()) || command_args.contains(&"--verbose".to_string());
+    let no_confirm = command_args.contains(&"--no-confirm".to_string());
+    let quiet = command_args.contains(&"-q".to_string()) || command_args.contains(&"--quiet".to_string());
+
+    let mut packages_to_update = Vec::new();
+    for arg in command_args {
+        if !arg.starts_with('-') {
+            packages_to_update.push(arg.clone());
+        }
+    }
+
+    let lym_dir = get_lym_dir().map_err(|e| format!("Failed to get lym dir: {}", e))?;
+    let config_path = lym_dir.join("config.json");
+    let config_json: JsonValue = fs::read_to_string(&config_path)
+        .map_err(|e| format!("Failed to read config.json: {}", e))
+        .and_then(|data| serde_json::from_str(&data).map_err(|e| format!("Invalid config.json: {}", e)))?;
+
+    let lucia_path = Path::new(
+        config_json.get("lucia_path")
+            .and_then(JsonValue::as_str)
+            .ok_or("Lucia path not set in config. Run lym config or reinstall lucia.")?
+    );
+    let lucia_real = lucia_path.canonicalize().unwrap_or_else(|_| lucia_path.to_path_buf());
+
+    if command_args == ["lucia"] {
+        let lucia_dir = lucia_real.parent()
+            .ok_or("Failed to determine lucia directory")?
+            .parent()
+            .ok_or("Failed to determine lucia directory")?
+            .parent()
+            .ok_or("Failed to determine lucia directory")?
+            .parent()
+            .ok_or("Failed to determine lucia directory")?
+            .to_path_buf();
+        return update_lucia(&lucia_dir, verbose, no_confirm, quiet);
+    }
+
+    let libs_dir = lucia_real.parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(&lucia_real)
+        .join("libs");
+
+    if !libs_dir.exists() {
+        if verbose {
+            println!("{}", format!("libs directory not found at {}, creating it", libs_dir.display()).yellow());
+        }
+        fs::create_dir_all(&libs_dir).map_err(|e| format!("Failed to create libs dir: {}", e))?;
+    }
+
+    let installed_packages = fs::read_dir(&libs_dir)
+        .map_err(|e| format!("Failed to read libs directory: {}", e))?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .filter(|entry| !STD_LIBS.contains_key(&entry.file_name().to_string_lossy()))
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect::<HashSet<_>>();    
+
+    for package in &packages_to_update {
+        if STD_LIBS.contains_key(package) {
+            return Err(format!("Package '{}' is a standard library and cannot be updated via lym", package));
+        }
+        if !installed_packages.contains(package){
+            return Err(format!("Package '{}' is not installed", package));
+        }
+    }
+
+    let headers = {
+        let mut headers = HeaderMap::new();
+        headers.insert(USER_AGENT, HeaderValue::from_static("lym-update"));
+
+        if let Some((username, token)) = get_lym_auth() {
+            let auth_val = format!("Basic {}", general_purpose::STANDARD.encode(format!("{}:{}", username, token)));
+            if let Ok(h) = HeaderValue::from_str(&auth_val) {
+                headers.insert(AUTHORIZATION, h);
+            }
+        }
+
+        headers
+    };
+
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(10)
+        .tcp_keepalive(Duration::from_secs(60))
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("{}", format!("Failed to build HTTP client: {}", e).red());
+            exit(1);
+        });
+        
+    let repo_slug = config_json.get("repository_slug")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("SirPigari/lym-libs");
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("Failed to create async runtime: {}", e))?;
+
+    'pkg_loop: for package in installed_packages {
+        if !packages_to_update.is_empty() && !packages_to_update.contains(&package) {
+            if verbose {
+                println!("{}", format!("Skipping package '{}' as it's not in the update list", package).yellow());
+            }
+            continue;
+        }
+        match rt.block_on(get_current_and_latest_version(&client, &repo_slug, &package, &libs_dir)) {
+            (Some(current), Some(latest)) => {
+                if cmp_version(&current, &latest) == Some(Ordering::Less) {
+                    println!("{}", format!("Updating package '{}' from version {} to {}", package, current, latest).bright_green());
+                    if !no_confirm {
+                        if !Confirm::new()
+                            .with_prompt(format!("Proceed with updating '{}'?", package))
+                            .default(true)
+                            .interact()
+                            .map_err(|e| format!("Failed to read user input: {}", e))? {
+                            println!("{}", format!("Skipping update for package '{}'", package).yellow());
+                            continue 'pkg_loop;
+                        }
+                    }
+                    let mut install_args = vec![package.clone(), "--no-confirm".to_string()];
+                    if verbose {
+                        install_args.push("-v".to_string());
+                    }
+                    if quiet {
+                        install_args.push("-q".to_string());
+                    }
+                    install(&install_args);
+                } else {
+                    println!("{}", format!("Package '{}' is up to date (version {})", package, current).bright_blue());
+                }
+            }
+            (Some(_), None) => {
+                println!("{}", format!("Could not determine latest version for package '{}', skipping", package).yellow());
+            }
+            (None, _) => {
+                println!("{}", format!("Could not determine current version for package '{}', skipping", package).yellow());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn update(command_args: &[String]) {
+    if let Err(e) = update_packages(command_args) {
+        eprintln!("{}", format!("Error updating packages: {}", e).red());
+        exit(1);
+    }
+}
+
+async fn get_current_and_latest_version(
+    client: &reqwest::Client,
+    repo_slug: &str,
+    pkg_name: &str,
+    libs_dir: &Path,
+) -> (Option<String>, Option<String>) {
+    let module_dir = libs_dir.join(pkg_name);
+    let current = if module_dir.is_dir() {
+        let manifest_path = module_dir.join("manifest.json");
+        if let Ok(manifest_str) = fs::read_to_string(manifest_path) {
+            if let Ok(manifest_json) = serde_json::from_str::<JsonValue>(&manifest_str) {
+                manifest_json
+                    .get("version")
+                    .and_then(JsonValue::as_str)
+                    .map(|v| v.to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let latest = {
+        let url = format!(
+            "https://api.github.com/repos/{}/contents/{}",
+            repo_slug, pkg_name
+        );
+
+        let resp = match client.get(&url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => return (current, None),
+        };
+
+        let entries: Vec<JsonValue> = resp.json().await.unwrap_or_default();
+        let mut latest: Option<String> = None;
+
+        for entry in &entries {
+            let name = entry.get("name").and_then(JsonValue::as_str).unwrap_or("");
+            if !name.starts_with('@') {
+                continue;
+            }
+
+            let ver = &name[1..];
+
+            match &latest {
+                Some(cur) if cmp_version(cur, ver) != Some(std::cmp::Ordering::Less) => {}
+                _ => latest = Some(ver.to_string()),
+            }
+        }
+
+        latest
+    };
+
+    (current, latest)
+}
+
 fn print_help() {
     println!(
-        "{} - {}\n\n{}:\n  {} <command> [args]\n\n{}:\n  {}   Install a package\n  {}      List installed packages\n  {}  Download a package\n  {}    Remove a package\n  {}   Disable a package\n  {}    Enable a package\n  {}    Set configuration options (lucia or lym)\n  {}    Modify package manifest\n  {}   Publish a package\n  {}     Login a user\n  {}       Create a new package\n\n{} 'lym <command> --help' {} for more info on a command.\n",
+        "{} - {}\n\n{}:\n  {} <command> [args]\n\n{}:\n  {}   Install a package\n  {}      List installed packages\n  {}  Download a package\n  {}    Remove a package\n  {}   Disable a package\n  {}    Enable a package\n  {}    Set configuration options (lucia or lym)\n  {}    Modify package manifest\n  {}   Publish a package\n  {}     Login a user\n  {}       Create a new package\n  {}    Update packages\n\n{} {} for more info on a command.\n",
         "lym".bright_blue().bold(),
         "Lucia package manager".bright_white(),
         "Usage".bright_green().bold(),
@@ -248,6 +464,7 @@ fn print_help() {
         "publish".bright_cyan(),
         "login".bright_cyan(),
         "new".bright_cyan(),
+        "update".bright_cyan(),
         "Use".bright_green(),
         "'lym <command> --help'".bright_yellow()
     );
@@ -349,9 +566,30 @@ fn command_help(cmd: &str) {
                 "Usage:".bright_green().bold(),
                 "lym".bright_cyan().bold(),
                 "new".bright_cyan(),
-                "[package | module] [name] [path] [--no-confirm] [--help] [--main-file:<name>]".bright_yellow(),
-                "Creates a new package/module with a basic manifest.json.".bright_white()
+                "[package | module] [name] [path] [OPTIONS]".bright_yellow(),
+                "Creates a new package/module with interactive prompts or from templates.".bright_white()
             );
+            println!("\n{}", "Interactive Mode (recommended):".bright_green());
+            println!("  lym new                 - Start interactive package creation");
+            println!("\n{}", "Quick Mode:".bright_green());
+            println!("  lym new package <name>  - Create a basic package");
+            println!("  lym new module <name>   - Create a basic module");
+            println!("\n{}", "Template Mode:".bright_green());
+            println!("  lym new -t <url> [name] - Clone a template from a Git URL");
+            println!("  lym new --template <url> [name]");
+            println!("\n{}", "Options:".bright_green());
+            println!("  --no-confirm            Skip confirmation prompts");
+            println!("  --main-file:<name>      Specify entry point file name");
+            println!("  -t, --template <url>    Clone from a Git repository");
+            println!("  --help, -h              Show this help message");
+            println!("\n{}", "Package Types (in interactive mode):".bright_green());
+            println!("  library     - Reusable library package");
+            println!("  application - Executable application");
+            println!("  bindings    - FFI bindings to C/other languages");
+            println!("  plugin      - Plugin for extending Lucia");
+            println!("  utility     - Command-line utility tools");
+            println!("  game        - Game or interactive application");
+            println!("  web         - Web server or web-related package");
         }
         "publish" => {
             println!(
@@ -372,6 +610,21 @@ fn command_help(cmd: &str) {
                 "[--help]".bright_yellow(),
                 "Logs in a user by storing their GitHub username and Personal Access Token.".bright_white()
             );
+        }
+        "update" => {
+            println!(
+                "{} {} {} {}\n\n{}",
+                "Usage:".bright_green().bold(),
+                "lym".bright_cyan().bold(),
+                "update".bright_cyan(),
+                "[--no-confirm] [-v] [-q] [--help]".bright_yellow(),
+                "Updates installed packages to their latest versions.".bright_white()
+            );
+            println!("{}", "Options:".bright_green());
+            println!("  --no-confirm        Skip confirmation prompts");
+            println!("  -v                  Enable verbose output");
+            println!("  -q                  Enable quiet output");
+            println!("  --help, -h          Show this help message");
         }
         _ => {
             eprintln!("{}", format!("Unknown command: '{}'", cmd).red().bold());
@@ -1239,7 +1492,7 @@ fn install_single_package(
     if !lym_config.skip_config_check {
         if let Some(required_config) = manifest.get("config").and_then(JsonValue::as_object) {
             if !required_config.is_empty() {
-                let lucia_config_path = lucia_path
+                let lucia_config_path = lucia_real
                     .parent()
                     .and_then(|p| p.parent())
                     .map(|env_root| env_root.join("config.json"))
@@ -1551,11 +1804,14 @@ fn install_single_package(
 
     let api_url = format!("{}/@{}", package_name, chosen_version);
     
-    let lucia_executable = Path::new(
-        config_json.get("lucia_path")
-            .and_then(JsonValue::as_str)
-            .ok_or("Lucia path not set in config. Cannot run scripts.")?
-    );
+    let lucia_executable = {
+        let path = Path::new(
+            config_json.get("lucia_path")
+                .and_then(JsonValue::as_str)
+                .ok_or("Lucia path not set in config. Cannot run scripts.")?
+        );
+        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    };
 
     let execute_script = |script_name: &str, script_file: &str| -> Result<(), String> {
         let script_path = local_pkg_path.join(script_file);
@@ -1709,6 +1965,10 @@ fn install_single_package(
     }
 
     println!("{}", format!("Package '{}@{}' installed successfully.", package_name, chosen_version).bright_green());
+
+    if verbose {
+        println!("{}", format!("Installed at: {}", local_pkg_path.display()).bright_cyan());
+    }
 
     Ok(())
 }
@@ -3367,23 +3627,58 @@ fn modify(args: &[String]) {
 }
 
 fn new(args: &[String]) {
-    if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
         command_help("new");
         return;
     }
 
-    let mut args = args.iter();
-    let kind = match args.next() {
+    let mut no_confirm = false;
+    let mut template_url: Option<String> = None;
+    let mut args_iter = args.iter();
+    
+    while let Some(arg) = args_iter.clone().peekable().peek() {
+        if arg == &"--no-confirm" {
+            no_confirm = true;
+            args_iter.next();
+        } else if arg == &"--template" || arg == &"-t" {
+            args_iter.next();
+            if let Some(url) = args_iter.next() {
+                template_url = Some(url.to_string());
+            } else {
+                eprintln!("{}", "Error: --template requires a URL argument".red());
+                return;
+            }
+        } else {
+            break;
+        }
+    }
+
+    if let Some(url) = template_url {
+        clone_template_from_url(&url, args_iter.collect(), no_confirm);
+        return;
+    }
+
+    if args.is_empty() || (args.len() == 1 && no_confirm) {
+        interactive_new(no_confirm);
+        return;
+    }
+
+    let kind = match args_iter.next() {
         Some(k) if k == "package" || k == "module" => k.as_str(),
-        _ => {
-            eprintln!("{}", "First argument must be 'package' or 'module'.".red());
+        Some(other) => {
+            eprintln!("{}", format!("Unknown type '{}'. Must be 'package' or 'module'.", other).red());
+            command_help("new");
+            return;
+        }
+        None => {
+            eprintln!("{}", "Missing type argument.".red());
             command_help("new");
             return;
         }
     };
 
-    let name = match args.next() {
-        Some(n) => n,
+    let name = match args_iter.next() {
+        Some(n) => n.to_string(),
         None => {
             eprintln!("{}", "Missing name argument.".red());
             command_help("new");
@@ -3391,32 +3686,452 @@ fn new(args: &[String]) {
         }
     };
 
-    let path = match args.next() {
+    let path = match args_iter.next() {
         Some(p) => PathBuf::from(p),
         None => {
             let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            current_dir.join(name)
+            current_dir.join(&name)
         }
     };
 
-    let mut no_confirm = false;
-    let mut main_file = String::from("__init__.lc");
-
-    for arg in args {
-        if arg == "--no-confirm" {
-            no_confirm = true;
-        } else if let Some(file) = arg.strip_prefix("--main-file:") {
+    let mut main_file = String::from("main.lc");
+    for arg in args_iter {
+        if let Some(file) = arg.strip_prefix("--main-file:") {
             main_file = file.to_string();
-        } else if arg == "--help" || arg == "-h" {
-            command_help("new");
-            return;
-        } else {
-            eprintln!("{}", format!("Unknown option '{}'", arg).yellow());
-            command_help("new");
+        }
+    }
+
+    create_project_from_template(kind, &name, &path, &main_file, "basic", no_confirm);
+}
+
+fn interactive_new(no_confirm: bool) {
+    println!("{}", "This utility will walk you through creating a new Lucia package.".bright_cyan());
+    println!("{}", "Press ^C at any time to quit.\n".dimmed());
+
+    let name: String = Input::new()
+        .with_prompt("Package name")
+        .default("my-package".to_string())
+        .interact_text()
+        .unwrap_or_else(|_| {
+            println!("{}", "Aborted.".yellow());
+            std::process::exit(0);
+        });
+
+    let version: String = Input::new()
+        .with_prompt("Version")
+        .default("0.1.0".to_string())
+        .interact_text()
+        .unwrap_or_else(|_| "0.1.0".to_string());
+
+    let description: String = Input::new()
+        .with_prompt("Description")
+        .default("".to_string())
+        .allow_empty(true)
+        .interact_text()
+        .unwrap_or_else(|_| "".to_string());
+
+    let package_types = vec![
+        "library - A reusable library package",
+        "application - An executable application",
+        "bindings - FFI bindings to C/other languages",
+        "plugin - A plugin for extending Lucia",
+        "utility - Command-line utility tools",
+        "game - Game or interactive application",
+        "web - Web server or web-related package",
+    ];
+
+    let type_selection = Select::new()
+        .with_prompt("Package type")
+        .items(&package_types)
+        .default(0)
+        .interact()
+        .unwrap_or(0);
+
+    let package_type = package_types[type_selection].split(" - ").next().unwrap();
+
+    let author: String = Input::new()
+        .with_prompt("Author")
+        .default("".to_string())
+        .allow_empty(true)
+        .interact_text()
+        .unwrap_or_else(|_| "".to_string());
+
+    let license: String = Input::new()
+        .with_prompt("License")
+        .default("MIT".to_string())
+        .interact_text()
+        .unwrap_or_else(|_| "MIT".to_string());
+
+    let entry_point: String = Input::new()
+        .with_prompt("Entry point")
+        .default("main.lc".to_string())
+        .interact_text()
+        .unwrap_or_else(|_| "main.lc".to_string());
+
+    let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let path = current_dir.join(&name);
+
+    println!("\n{}", "About to create:".bright_green());
+    println!("  Name:        {}", name.bright_cyan());
+    println!("  Version:     {}", version);
+    println!("  Description: {}", description);
+    println!("  Type:        {}", package_type.bright_yellow());
+    println!("  Author:      {}", author);
+    println!("  License:     {}", license);
+    println!("  Entry:       {}", entry_point);
+    println!("  Path:        {}\n", path.display().to_string().bright_blue());
+
+    if !no_confirm {
+        let confirm = Confirm::new()
+            .with_prompt("Is this OK?")
+            .default(true)
+            .interact()
+            .unwrap_or(false);
+
+        if !confirm {
+            println!("{}", "Aborted.".yellow());
             return;
         }
     }
 
+    create_interactive_project(&name, &version, &description, package_type, &author, &license, &entry_point, &path, no_confirm);
+}
+
+fn create_interactive_project(
+    name: &str,
+    version: &str,
+    description: &str,
+    package_type: &str,
+    author: &str,
+    license: &str,
+    entry_point: &str,
+    path: &Path,
+    no_confirm: bool,
+) {
+    if path.exists() && !no_confirm {
+        let confirm = Confirm::new()
+            .with_prompt(format!("Directory '{}' already exists. Overwrite?", path.display()))
+            .default(false)
+            .interact()
+            .unwrap_or(false);
+        if !confirm {
+            println!("{}", "Aborted.".yellow());
+            return;
+        }
+        fs::remove_dir_all(path).ok();
+    }
+
+    if let Err(e) = fs::create_dir_all(path) {
+        eprintln!("{}", format!("Failed to create directory: {}", e).red());
+        return;
+    }
+
+    let lym_dir = match get_lym_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{}", format!("Failed to get lym dir: {}", e).red());
+            return;
+        }
+    };
+
+    let main_config_path = lym_dir.join("config.json");
+    let main_config_json: JsonValue = fs::read_to_string(&main_config_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    
+    let required_version = main_config_json
+        .get("build_info")
+        .and_then(|bi| bi.get("version"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("0.0.0")
+        .to_string();
+
+    let mut manifest = json!({
+        "name": name,
+        "version": version,
+        "description": description,
+        "required_lucia_version": format!("^{}", required_version),
+        "license": license,
+        "type": package_type,
+    });
+
+    if !author.is_empty() {
+        manifest["authors"] = json!([author]);
+    }
+
+    let manifest_path = path.join("manifest.json");
+    if let Err(e) = fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap()) {
+        eprintln!("{}", format!("Failed to write manifest.json: {}", e).red());
+        return;
+    }
+
+    let template_content = match package_type {
+        "library" => generate_library_template(name),
+        "application" => generate_application_template(name),
+        "bindings" => generate_bindings_template(name),
+        "plugin" => generate_plugin_template(name),
+        "utility" => generate_utility_template(name),
+        "game" => generate_game_template(name),
+        "web" => generate_web_template(name),
+        _ => generate_basic_template(),
+    };
+
+    if let Err(e) = fs::write(path.join(entry_point), template_content) {
+        eprintln!("{}", format!("Failed to create {}: {}", entry_point, e).red());
+        return;
+    }
+
+    let readme = format!(
+        "# {}\n\n{}\n\n## Installation\n\n```bash\nlym install {}\n```\n\n## Usage\n\n```lucia\nimport {} from \"{}\"\n```\n\n## License\n\n{}\n",
+        name,
+        description,
+        name,
+        name,
+        name,
+        license
+    );
+    fs::write(path.join("README.md"), readme).ok();
+
+    let lym_config = json!({
+        "ignore": [".git", "*.tmp"],
+        "supported_platforms": ["windows", "linux", "macos"],
+    });
+    fs::write(path.join("lym.json"), serde_json::to_string_pretty(&lym_config).unwrap()).ok();
+
+    println!("{}", format!("\nPackage '{}' created at {}", name, path.display()).bright_green().bold());
+    println!("{}", "\nNext steps:".bright_cyan());
+    println!("  cd {}", name);
+    println!("  # Edit your code in {}", entry_point);
+    println!("  lym publish  # When ready to publish");
+}
+
+fn generate_library_template(name: &str) -> String {
+    format!(r#"// {} Library
+
+public final fun add(a: int, b: int) -> int:
+    return a + b
+end
+
+public final fun subtract(a: int, b: int) -> int:
+    return a - b
+end
+
+public final fun multiply(a: int, b: int) -> int:
+    return a * b
+end
+
+public final fun divide(a: int, b: int) -> float:
+    if b == 0:
+        print("Error: Division by zero")
+        return 0.0
+    end
+    return float(a) / float(b)
+end
+"#, name)
+}
+
+fn generate_application_template(name: &str) -> String {
+    format!(r#"// {} Application
+
+final fun main() -> void:
+    print("Welcome to {}!")
+    print("Version: 0.1.0")
+    
+    // Your application logic here
+end
+
+main()
+"#, name, name)
+}
+
+fn generate_bindings_template(name: &str) -> String {
+    let lib_load = if cfg!(target_os = "windows") {
+        ".dll\")  // or .so on Linux, .dylib on macOS"
+    } else if cfg!(target_os = "macos") {
+        ".dylib\")  // or .dll on Windows, .so on Linux"
+    } else {
+        ".so\")  // or .dll on Windows, .dylib on macOS"
+    };
+    format!(r#"// {} FFI Bindings
+
+// Load the native library
+import libload
+
+private final lib: &int = libload.load_lib(__dir__ + "./{}{}
+
+private final example_function_c: &int = libload.get_fn(lib, "example_function", ["int"], "int")
+
+// Define C function bindings
+public final fun example_function(arg: int) -> int:
+    return libload.call_fn(lib, example_function_c, [arg])
+end
+
+// Cleanup
+public final fun cleanup() -> void:
+    libload.unload_lib(lib)
+end
+"#, name, name, lib_load)
+}
+
+fn generate_plugin_template(name: &str) -> String {
+    format!(r#"// {} Plugin
+
+// Plugin metadata
+public final PLUGIN_NAME: str = "{}"
+public final PLUGIN_VERSION: str = "0.1.0"
+
+// Plugin initialization
+public final fun init() -> void:
+    print("Initializing {} plugin...")
+end
+
+// Plugin main functionality
+public final fun execute(args: list) -> void:
+    print("Plugin {} executing with args:", PLUGIN_NAME)
+    for arg in args:
+        print("  - ", arg)
+    end
+end
+
+// Plugin cleanup
+public final fun cleanup() -> void:
+    print("Cleaning up {} plugin...")
+end
+"#, name, name, name, name, name)
+}
+
+fn generate_utility_template(name: &str) -> String {
+    format!(r#"// {} Utility
+
+final fun print_help() -> void:
+    print("Usage: {} [OPTIONS]")
+    print("")
+    print("Options:")
+    print("  --help, -h     Show this help message")
+    print("  --version, -v  Show version")
+end
+
+final fun main() -> void:
+    if len(argv) == 0:
+        print_help()
+        return
+    end
+    
+    for arg in argv:
+        if arg == "--help" || arg == "-h":
+            print_help()
+            return
+        else if arg == "--version" || arg == "-v":
+            print("{} version 0.1.0")
+            return
+        end
+    end
+    
+    // Your utility logic here
+    print("Running {}...")
+end
+
+main()
+"#, name, name, name, name)
+}
+
+fn generate_game_template(name: &str) -> String {
+    format!(r#"// {} Game
+
+// Game state
+score: &int = &0
+running: &bool = &true
+
+// Initialize game
+final fun init() -> void:
+    print("=== {} ===")
+    print("Starting game...")
+    *score = 0, // comma because parser
+    *running = true
+end
+
+// Game loop
+fun update() -> void:
+    // Update game logic here
+    *score = *score + 1
+end
+
+// Render game
+fun render() -> void:
+    print("Score: ", *score)
+end
+
+// Main game loop
+fun main() -> void:
+    init()
+    
+    while *running:
+        update()
+        render()
+        
+        // Simple exit condition for demo
+        if *score >= 10:
+            *running = false
+        end
+    end
+    
+    print("Game Over! Final Score: ", *score)
+end
+
+main()
+"#, name, name)
+}
+
+fn generate_web_template(name: &str) -> String {
+    format!(r#"// {} Web Server
+
+import nest
+
+// Define routes
+fun handle_index(req: map, res: map) -> void:
+    res["body"] = "<h1>Welcome to {}</h1>"
+    res["status"] = 200
+end
+
+fun handle_api(req: map, res: map) -> void:
+    res["body"] = '{{"message": "API endpoint", "version": "0.1.0"}}'
+    res["headers"]["Content-Type"] = "application/json"
+    res["status"] = 200
+end
+
+// Start server
+fun main() -> void:
+    let server = nest.create_server()
+    
+    server.route("GET", "/", handle_index)
+    server.route("GET", "/api", handle_api)
+    
+    print("Starting {} server on http://localhost:6969")
+    server.listen(6969)
+end
+
+main()
+"#, name, name, name)
+}
+
+fn generate_basic_template() -> String {
+    r#"fun main() -> void:
+    print("Hello, World!")
+end
+
+main()
+"#.to_string()
+}
+
+fn create_project_from_template(
+    kind: &str,
+    name: &str,
+    path: &Path,
+    main_file: &str,
+    template: &str,
+    no_confirm: bool,
+) {
     if path.exists() && !no_confirm {
         let confirm = Confirm::new()
             .with_prompt(format!("Path '{}' already exists. Overwrite?", path.display()))
@@ -3427,10 +4142,10 @@ fn new(args: &[String]) {
             println!("{}", "Aborted.".yellow());
             return;
         }
-        fs::remove_dir_all(&path).ok();
+        fs::remove_dir_all(path).ok();
     }
 
-    if let Err(e) = fs::create_dir_all(&path) {
+    if let Err(e) = fs::create_dir_all(path) {
         eprintln!("{}", format!("Failed to create path: {}", e).red());
         return;
     }
@@ -3462,7 +4177,7 @@ fn new(args: &[String]) {
             let manifest = json!({
                 "name": name,
                 "version": "0.1.0",
-                "description": "A simple Lucia package",
+                "description": "",
                 "required_lucia_version": format!("^{}", required_version),
                 "license": "MIT",
             });            
@@ -3472,7 +4187,13 @@ fn new(args: &[String]) {
                 return;
             }
 
-            if fs::write(path.join(&main_file), "fun main() -> void:\n    print(\"Hello world\")\nend\n\nmain()\n").is_err() {
+            let content = if template == "basic" {
+                generate_basic_template()
+            } else {
+                generate_basic_template()
+            };
+
+            if fs::write(path.join(main_file), content).is_err() {
                 eprintln!("{}", "Failed to create main file.".red());
             }
 
@@ -3481,12 +4202,12 @@ fn new(args: &[String]) {
 
         "module" => {
             let module_path = path.join(format!("{}.lc", name));
-            if let Err(e) = fs::create_dir_all(&path) {
+            if let Err(e) = fs::create_dir_all(path) {
                 eprintln!("{}", format!("Failed to create module directory: {}", e).red());
                 return;
             }
 
-            if fs::write(&module_path, "fun main() -> void:\n    print(\"Hello world\")\nend\n\nmain()\n".as_bytes()).is_err() {
+            if fs::write(&module_path, generate_basic_template().as_bytes()).is_err() {
                 eprintln!("{}", "Failed to create module file.".red());
                 return;
             }
@@ -3495,6 +4216,76 @@ fn new(args: &[String]) {
         }
 
         _ => unreachable!(),
+    }
+}
+
+fn clone_template_from_url(url: &str, remaining_args: Vec<&String>, no_confirm: bool) {
+    println!("{}", format!("Cloning template from {}...", url).bright_cyan());
+
+    let name: String = if !remaining_args.is_empty() {
+        remaining_args[0].to_string()
+    } else if no_confirm {
+        "cloned-project".to_string()
+    } else {
+        Input::new()
+            .with_prompt("Project name")
+            .default("cloned-project".to_string())
+            .interact_text()
+            .unwrap_or_else(|_| "cloned-project".to_string())
+    };
+
+    let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let target_path = current_dir.join(&name);
+
+    if target_path.exists() && !no_confirm {
+        let confirm = Confirm::new()
+            .with_prompt(format!("Directory '{}' already exists. Overwrite?", target_path.display()))
+            .default(false)
+            .interact()
+            .unwrap_or(false);
+        
+        if !confirm {
+            println!("{}", "Aborted.".yellow());
+            return;
+        }
+        fs::remove_dir_all(&target_path).ok();
+    }
+
+    let output = Command::new("git")
+        .args(&["clone", url, target_path.to_str().unwrap_or(&name)])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            fs::remove_dir_all(target_path.join(".git")).ok();
+            
+            println!("{}", format!("Template cloned to {}", target_path.display()).bright_green().bold());
+            
+            let manifest_path = target_path.join("manifest.json");
+            if manifest_path.exists() {
+                if let Ok(content) = fs::read_to_string(&manifest_path) {
+                    if let Ok(mut manifest) = serde_json::from_str::<JsonValue>(&content) {
+                        manifest["name"] = json!(name);
+                        if let Ok(updated) = serde_json::to_string_pretty(&manifest) {
+                            fs::write(&manifest_path, updated).ok();
+                            println!("{}", "Updated manifest.json with new name".green());
+                        }
+                    }
+                }
+            }
+            
+            println!("{}", "\nNext steps:".bright_cyan());
+            println!("  cd {}", name);
+            println!("  # Review and edit the cloned template");
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprintln!("{}", format!("Failed to clone template: {}", stderr).red());
+        }
+        Err(e) => {
+            eprintln!("{}", format!("Failed to execute git clone: {}", e).red());
+            eprintln!("{}", "Make sure git is installed and accessible.".yellow());
+        }
     }
 }
 
@@ -5034,6 +5825,7 @@ fn main() {
         "new" => new(command_args),
         "login" => login(command_args),
         "publish" => publish(command_args),
+        "update" => update(command_args),
         "--help" => print_help(),
         _ => {
             eprintln!("{}", format!("Unknown command: '{}'\n", command).red());

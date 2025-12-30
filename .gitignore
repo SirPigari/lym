@@ -1,8 +1,9 @@
 /target
-/lym.exe
+/lym*
 Cargo.lock
 .vscode/
 /bin/
+test.lc
 
 # old library folder
 libs/

@@ -53,7 +53,11 @@ ifeq ($(IS_WINDOWS),cmd.exe)
 	@$(COPY) "$(subst /,\\,$(TARGET_BIN))" "$(subst /,\\,$(TARGET_TMP))"
 	@$(MOVE) "$(subst /,\\,$(TARGET_TMP))" "$(subst /,\\,$(TARGET))"
 else
-	@$(MOVE) "$(LYM_DIR)/target/release/$(TARGET_EXE)" "$(TARGET)"
+	@$(MOVE) "$(LYM_DIR)/target/release/$(TARGET_EXE)" "$(TARGET_BIN)"
+	@$(COPY) "$(TARGET_BIN)" "$(TARGET_TMP)"
+	@$(MOVE) "$(TARGET_TMP)" "$(TARGET)"
+	@chmod +x "$(TARGET)"
+	@chmod +x "$(TARGET_BIN)"
 endif
 
 run: $(TARGET)
